@@ -1,14 +1,11 @@
 GO ?= go
 
-.PHONY: all chirik chiriked test lint clean
+.PHONY: all chirik test lint clean
 
-all: chirik chiriked
+all: chirik
 
 chirik:
 	CGO_ENABLED=0 $(GO) build -o $@ ./cmd/chirik
-
-chiriked:
-	CGO_ENABLED=0 $(GO) build -o $@ ./cmd/chiriked
 
 test:
 	$(GO) test ./...

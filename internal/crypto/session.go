@@ -57,17 +57,7 @@ func KeyPairGenerate() (*KeyPair, error) {
 	return keyPairNew(private), nil
 }
 
-func KeyPairFromPrivate(privateBytes []byte) (*KeyPair, error) {
-	private, err := ecdh.X25519().NewPrivateKey(privateBytes)
-	if err != nil {
-		return nil, fmt.Errorf("private key: %w", err)
-	}
-
-	return keyPairNew(private), nil
-}
-
 func (p *KeyPair) Public() [PublicKeyBytes]byte { return p.public }
-func (p *KeyPair) PrivateBytes() []byte         { return append([]byte(nil), p.private.Bytes()...) }
 
 func (p *KeyPair) Derive(peerBytes []byte, salt []byte) (Keys, error) {
 	var keys Keys

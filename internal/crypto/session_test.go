@@ -3,6 +3,7 @@ package crypto
 import (
 	"bytes"
 	"errors"
+	"net"
 	"testing"
 
 	"chirik/internal/proto"
@@ -13,14 +14,14 @@ func TestDeriveComplements(t *testing.T) {
 	b := keyPair(t)
 	publicA := a.Public()
 	publicB := b.Public()
-	salt := bytes.Repeat([]byte{0xa5}, proto.ChannelBytes)
+	salt := proto.ChannelKey("test channel")
 
-	keysA, err := a.Derive(publicB[:], salt)
+	keysA, err := a.Derive(publicB[:], salt[:])
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	keysB, err := b.Derive(publicA[:], salt)
+	keysB, err := b.Derive(publicA[:], salt[:])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,30 +44,20 @@ func TestDeriveSeparatesChannels(t *testing.T) {
 	b := keyPair(t)
 	publicB := b.Public()
 
-	first, err := a.Derive(publicB[:], bytes.Repeat([]byte{1}, proto.ChannelBytes))
+	firstSalt := proto.ChannelKey("first")
+	first, err := a.Derive(publicB[:], firstSalt[:])
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	second, err := a.Derive(publicB[:], bytes.Repeat([]byte{2}, proto.ChannelBytes))
+	secondSalt := proto.ChannelKey("second")
+	second, err := a.Derive(publicB[:], secondSalt[:])
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	if first.Send == second.Send || first.Receive == second.Receive {
 		t.Fatal("channel did not separate derived material")
-	}
-}
-
-func TestKeyPairFromPrivate(t *testing.T) {
-	original := keyPair(t)
-	restored, err := KeyPairFromPrivate(original.PrivateBytes())
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if restored.Public() != original.Public() {
-		t.Fatal("restored public key differs")
 	}
 }
 
@@ -132,7 +123,12 @@ func TestSessionAcceptsGapDropsReordering(t *testing.T) {
 
 func TestSessionCountersArePerType(t *testing.T) {
 	sessionA, sessionB := sessionPair(t)
-	request, err := sessionA.Seal(proto.Type_Request, make([]byte, proto.RequestBytes))
+	requestPayload, _ := proto.Request(
+		"Alice",
+		"room",
+		&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 7777},
+	)
+	request, err := sessionA.Seal(proto.Type_Request, requestPayload)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,13 +170,13 @@ func sessionPair(t *testing.T) (*Session, *Session) {
 	b := keyPair(t)
 	publicA := a.Public()
 	publicB := b.Public()
-	salt := bytes.Repeat([]byte{0xa5}, proto.ChannelBytes)
-	keysA, err := a.Derive(publicB[:], salt)
+	salt := proto.ChannelKey("test channel")
+	keysA, err := a.Derive(publicB[:], salt[:])
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	keysB, err := b.Derive(publicA[:], salt)
+	keysB, err := b.Derive(publicA[:], salt[:])
 	if err != nil {
 		t.Fatal(err)
 	}

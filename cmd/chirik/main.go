@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	cryptorand "crypto/rand"
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
@@ -12,6 +11,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,14 +25,18 @@ import (
 	"chirik/internal/proto"
 )
 
-const terminalLineClear = "\r\x1b[2K"
+const (
+	terminalLineClear = "\r\x1b[2K"
+	terminalCursorUp  = "\x1b[1A"
+)
 
 type config struct {
-	callsign proto.Callsign
-	channel  proto.Channel
-	peerex   *net.UDPAddr
-	source   string
-	sink     string
+	handle     proto.Handle
+	channel    string
+	channelKey [32]byte
+	peerex     *net.UDPAddr
+	source     string
+	sink       string
 }
 
 type datagram struct {
@@ -62,14 +66,15 @@ type link struct {
 	peerPublic [sessioncrypto.PublicKeyBytes]byte
 	voice      *sessioncrypto.Session
 
-	callsign         proto.Callsign
-	callsignKnown    bool
-	expectedCallsign proto.Callsign
-	expectedKnown    bool
+	handle         proto.Handle
+	handleKnown    bool
+	expectedHandle proto.Handle
+	expectedKnown  bool
 
 	state            linkState
 	initiated        bool
 	peerex           bool
+	relay            bool
 	bootstrap        bool
 	audioEligible    bool
 	responseReceived bool
@@ -86,6 +91,10 @@ type link struct {
 	playback     audio.PlaybackWriter
 	concealer    audio.Concealer
 	lastAudioSeq uint64
+
+	counters             counters
+	sampledSentBytes     uint64
+	sampledReceivedBytes uint64
 }
 
 type counters struct {
@@ -96,21 +105,30 @@ type counters struct {
 	receivedBytes atomic.Uint64
 }
 
+type peerBitrate struct {
+	handle        proto.Handle
+	bytesReceived uint64
+	bytesSent     uint64
+}
+
 type output struct {
-	writer io.Writer
-	mu     sync.Mutex
+	writer       io.Writer
+	mu           sync.Mutex
+	bitrateLines int
 }
 
 type manager struct {
 	ctx          context.Context
 	t            *transport
 	cfg          config
+	local        *net.UDPAddr
 	playbackOpen func(string) (audio.PlaybackWriter, error)
 	output       *output
 	stderr       io.Writer
 
-	links map[string][]*link
-	seen  map[proto.Callsign]struct{}
+	links     map[string][]*link
+	seen      map[proto.Handle]struct{}
+	discovery *discoveryEngine
 
 	frames   chan []byte
 	commands chan byte
@@ -136,33 +154,17 @@ func run(args []string, stdout io.Writer, stderr io.Writer) int {
 	}
 
 	switch args[0] {
-	case "mint":
-		return mintRun(args[1:], stdout, stderr)
-
 	case "chirp":
 		return chirpRun(args[1:], stdout, stderr)
+
+	case "exchange":
+		return exchangeRun(args[1:], stderr)
 
 	default:
 		fmt.Fprintf(stderr, "unknown command %q\n", args[0])
 		usage(stderr)
 		return 2
 	}
-}
-
-func mintRun(args []string, stdout io.Writer, stderr io.Writer) int {
-	if len(args) != 1 {
-		fmt.Fprintln(stderr, "usage: chirik mint <prefix>")
-		return 2
-	}
-
-	callsign, err := callsignMint(args[0], cryptorand.Reader)
-	if err != nil {
-		fmt.Fprintf(stderr, "mint callsign: %v\n", err)
-		return 2
-	}
-
-	fmt.Fprintln(stdout, base64.StdEncoding.EncodeToString(callsign[:]))
-	return 0
 }
 
 func chirpRun(args []string, stdout io.Writer, stderr io.Writer) int {
@@ -187,6 +189,11 @@ func chirpRun(args []string, stdout io.Writer, stderr io.Writer) int {
 		conn.Close()
 		<-t.stopped
 	}()
+	local, err := localEndpoint(conn, cfg.peerex)
+	if err != nil {
+		fmt.Fprintf(stderr, "local UDP endpoint: %v\n", err)
+		return 1
+	}
 
 	device, err := audio.Open(cfg.source, cfg.sink)
 	if err != nil {
@@ -211,16 +218,18 @@ func chirpRun(args []string, stdout io.Writer, stderr io.Writer) int {
 		ctx:          ctx,
 		t:            t,
 		cfg:          cfg,
+		local:        local,
 		playbackOpen: func(name string) (audio.PlaybackWriter, error) { return device.PlaybackOpen(name) },
 		output:       &output{writer: stdout},
 		stderr:       stderr,
 		links:        make(map[string][]*link),
-		seen:         map[proto.Callsign]struct{}{cfg.callsign: {}},
+		seen:         map[proto.Handle]struct{}{cfg.handle: {}},
 		frames:       make(chan []byte, 8),
 		commands:     make(chan byte, 8),
 		events:       make(chan error, 8),
 		readyCh:      make(chan struct{}),
 	}
+	m.discoveryEnsure()
 
 	initial, err := m.initialLink()
 	if err != nil {
@@ -251,11 +260,7 @@ func chirpRun(args []string, stdout io.Writer, stderr io.Writer) int {
 }
 
 func configParse(args []string, stderr io.Writer) (config, bool) {
-	var (
-		cfg          config
-		callsignText string
-		targetText   string
-	)
+	var cfg config
 
 	flags := flag.NewFlagSet("chirik chirp", flag.ContinueOnError)
 	flags.SetOutput(stderr)
@@ -263,126 +268,67 @@ func configParse(args []string, stderr io.Writer) (config, bool) {
 	flags.StringVar(&cfg.sink, "sink", "", "Pulse sink name")
 	flags.Usage = func() { chirpUsage(stderr, flags) }
 
-	if len(args) < 2 {
+	if len(args) == 0 {
 		flags.Usage()
 		return config{}, false
 	}
-	callsignText = args[0]
-	targetText = args[1]
-
-	if err := flags.Parse(args[2:]); err != nil {
+	target := args[0]
+	if err := flags.Parse(args[1:]); err != nil {
 		flags.Usage()
 		return config{}, false
 	}
-
 	if flags.NArg() != 0 {
 		flags.Usage()
 		return config{}, false
 	}
 
-	separator := strings.IndexByte(targetText, '/')
-	if separator <= 0 {
-		fmt.Fprintln(stderr, "target must be <peerex-host>:<peerex-port>/<channel>")
+	handleEnd := strings.IndexByte(target, '@')
+	channelStart := strings.IndexByte(target, '/')
+	if handleEnd <= 0 || channelStart <= handleEnd+1 || channelStart == len(target)-1 {
+		fmt.Fprintln(stderr, "target must be <handle>@<exchange-host>:<exchange-port>/<channel>")
 		return config{}, false
 	}
 
-	if !base64FixedDecode(cfg.callsign[:], callsignText) ||
-		!base64FixedDecode(cfg.channel[:], targetText[separator+1:]) {
-		fmt.Fprintln(stderr, "callsign and channel must each be a 32-byte base64 value")
+	cfg.handle = proto.Handle(target[:handleEnd])
+	cfg.channel = target[channelStart+1:]
+	if !proto.HandleValid(cfg.handle) {
+		fmt.Fprintln(stderr, "handle must contain only ASCII letters and digits")
 		return config{}, false
 	}
+	if !proto.RequestValid(cfg.handle, cfg.channel) {
+		fmt.Fprintln(stderr, "handle/channel request exceeds protocol limits")
+		return config{}, false
+	}
+	cfg.channelKey = proto.ChannelKey(cfg.channel)
 
-	peerex, err := net.ResolveUDPAddr("udp4", targetText[:separator])
+	exchange, err := net.ResolveUDPAddr("udp4", target[handleEnd+1:channelStart])
 	switch {
 	case err != nil:
 		fmt.Fprintf(stderr, "peer exchange address: %v\n", err)
 		return config{}, false
 
-	case peerex.Port == 0:
+	case exchange.Port == 0:
 		fmt.Fprintln(stderr, "peer exchange address: port must be non-zero")
 		return config{}, false
 
-	case len(peerex.IP) == 0 || peerex.IP.IsUnspecified():
+	case len(exchange.IP) == 0 || exchange.IP.IsUnspecified():
 		fmt.Fprintln(stderr, "peer exchange address: host must be specified")
 		return config{}, false
 	}
-	cfg.peerex = addrCopy(peerex)
+	cfg.peerex = addrCopy(exchange)
 
 	return cfg, true
 }
 
 func usage(w io.Writer) {
 	fmt.Fprintln(w, "usage:")
-	fmt.Fprintln(w, "  chirik mint <prefix>")
-	fmt.Fprintln(w, "  chirik chirp <callsign> <peerex-host>:<peerex-port>/<channel> [flags]")
+	fmt.Fprintln(w, "  chirik chirp <handle>@<exchange-host>:<exchange-port>/<channel> [flags]")
+	fmt.Fprintln(w, "  chirik exchange <host>:<port>")
 }
 
 func chirpUsage(w io.Writer, flags *flag.FlagSet) {
-	fmt.Fprintln(w, "usage: chirik chirp <callsign> <peerex-host>:<peerex-port>/<channel> [flags]")
+	fmt.Fprintln(w, "usage: chirik chirp <handle>@<exchange-host>:<exchange-port>/<channel> [flags]")
 	flags.PrintDefaults()
-}
-
-func base64FixedDecode(destination []byte, text string) bool {
-	if len(text) != base64.StdEncoding.EncodedLen(len(destination)) {
-		return false
-	}
-
-	decoded, err := base64.StdEncoding.Strict().DecodeString(text)
-	if err != nil || len(decoded) != len(destination) {
-		return false
-	}
-
-	copy(destination, decoded)
-	return true
-}
-
-func callsignMint(prefix string, random io.Reader) (proto.Callsign, error) {
-	var callsign proto.Callsign
-
-	if len(prefix) > base64.RawStdEncoding.EncodedLen(len(callsign)) {
-		return callsign, errors.New("prefix exceeds 43 base64 characters")
-	}
-
-	if _, err := io.ReadFull(random, callsign[:]); err != nil {
-		return callsign, err
-	}
-
-	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-	for charIndex := range len(prefix) {
-		value := strings.IndexByte(alphabet, prefix[charIndex])
-		if value < 0 {
-			return callsign, fmt.Errorf("prefix contains invalid base64 character %q", prefix[charIndex])
-		}
-
-		for bitIndex := range 6 {
-			var (
-				destinationBit = charIndex*6 + bitIndex
-				set            = value&(1<<(5-bitIndex)) != 0
-			)
-			if destinationBit >= len(callsign)*8 {
-				if set {
-					return callsign, errors.New("final prefix character cannot encode a 32-byte value")
-				}
-				continue
-			}
-
-			var (
-				byteIndex = destinationBit / 8
-				mask      = byte(1 << (7 - destinationBit%8))
-			)
-			if set {
-				callsign[byteIndex] |= mask
-			} else {
-				callsign[byteIndex] &^= mask
-			}
-		}
-	}
-
-	if !strings.HasPrefix(base64.StdEncoding.EncodeToString(callsign[:]), prefix) {
-		return callsign, errors.New("minted callsign does not match prefix")
-	}
-
-	return callsign, nil
 }
 
 func transportStart(conn *net.UDPConn) *transport {
@@ -454,11 +400,7 @@ func (m *manager) run() error {
 	bitrate := time.NewTicker(time.Second)
 	defer bitrate.Stop()
 
-	var (
-		bytesSentLast     uint64
-		bytesReceivedLast uint64
-		sampledAt         = time.Now()
-	)
+	sampledAt := time.Now()
 
 	for {
 		select {
@@ -498,16 +440,7 @@ func (m *manager) run() error {
 			}
 
 		case now := <-bitrate.C:
-			bytesSent := m.counters.sentBytes.Load()
-			bytesReceived := m.counters.receivedBytes.Load()
-			m.output.bitrateWrite(
-				bytesReceived-bytesReceivedLast,
-				bytesSent-bytesSentLast,
-				now.Sub(sampledAt),
-				m.audioPeerCount(),
-			)
-			bytesSentLast = bytesSent
-			bytesReceivedLast = bytesReceived
+			m.output.bitrateWrite(m.peerBitrates(), now.Sub(sampledAt))
 			sampledAt = now
 			debugf(
 				m.stderr,
@@ -581,7 +514,6 @@ func (m *manager) kexHandle(
 		if err != nil {
 			return
 		}
-
 		item = &link{
 			addr:        addrCopy(addr),
 			pair:        pair,
@@ -592,19 +524,22 @@ func (m *manager) kexHandle(
 		m.linkKEXSend(item, now)
 	}
 
-	salt := m.cfg.channel[:]
+	m.linkKEXComplete(item, peerPublic, now, kexReply)
+}
+
+func (m *manager) linkKEXComplete(
+	item *link,
+	peerPublic [sessioncrypto.PublicKeyBytes]byte,
+	now time.Time,
+	kexReply bool,
+) {
+	salt := m.cfg.channelKey[:]
 	if item.peerex {
-		zero := [proto.ChannelBytes]byte{}
+		zero := [32]byte{}
 		salt = zero[:]
 	}
 
-	keys, err := item.pair.Derive(peerPublic[:], salt)
-	if err != nil {
-		m.linkFail(item, fmt.Errorf("derive keys: %w", err))
-		return
-	}
-
-	voice, err := sessioncrypto.SessionNew(keys)
+	voice, err := discoverySessionNew(item.pair, peerPublic, salt)
 	if err != nil {
 		m.linkFail(item, fmt.Errorf("session keys: %w", err))
 		return
@@ -618,7 +553,7 @@ func (m *manager) kexHandle(
 	m.output.lineWrite(
 		fmt.Sprintf(
 			"peer %s public key %s",
-			item.addr,
+			linkEndpoint(item),
 			base64.StdEncoding.EncodeToString(peerPublic[:]),
 		),
 	)
@@ -660,11 +595,22 @@ func (m *manager) encryptedHandle(
 			return false
 		}
 
+	case proto.Type_Relay:
+		if !item.peerex {
+			return false
+		}
+		source, inner, ok := proto.RelayParse(payload)
+		if !ok || !m.relayPacketHandle(source, inner) {
+			return false
+		}
+
 	default:
 		return false
 	}
 
 	item.lastSeen = now
+	item.counters.received.Add(1)
+	item.counters.receivedBytes.Add(uint64(len(packet)))
 	m.counters.received.Add(1)
 	m.counters.receivedBytes.Add(uint64(len(packet)))
 
@@ -672,33 +618,38 @@ func (m *manager) encryptedHandle(
 }
 
 func (m *manager) requestHandle(item *link, payload []byte, now time.Time) bool {
-	callsign, channel, ok := proto.RequestParse(payload)
+	handle, channel, _, ok := m.discoveryEnsure().request(payload)
 	if !ok || channel != m.cfg.channel {
 		return false
 	}
 
-	if item.expectedKnown && callsign != item.expectedCallsign {
+	if item.expectedKnown && handle != item.expectedHandle {
 		return false
 	}
 
 	membershipChanged := !item.stateActive() || !item.audioEligible
-	item.callsign = callsign
-	item.callsignKnown = true
+	item.handle = handle
+	item.handleKnown = true
 	if err := m.linkPromote(item, now); err != nil {
 		m.linkFail(item, err)
 		return false
 	}
 
-	if !m.peerListSend(item, callsign) {
+	item.audioEligible = true
+	if item.relay {
+		if !m.relayPeerListSend(item) {
+			m.linkFail(item, errors.New("send relayed peer list failed"))
+			return false
+		}
+	} else if !m.discoveryEnsure().announce(
+		m.cfg.channel,
+		discoveryRecipient{addr: item.addr, handle: handle, session: item.voice},
+		membershipChanged,
+	) {
 		m.linkFail(item, errors.New("send peer list failed"))
 		return false
 	}
-
-	item.audioEligible = true
 	m.managerReady(item)
-	if membershipChanged {
-		m.peerListBroadcast()
-	}
 
 	return true
 }
@@ -709,14 +660,14 @@ func (m *manager) peerListHandle(
 	audioPeer bool,
 	now time.Time,
 ) bool {
-	records, ok := proto.PeerListParse(payload)
-	if !ok {
+	records, ok := m.discoveryEnsure().decode(payload)
+	if !ok || (item.relay && len(records) != 0) {
 		return false
 	}
 
 	if item.expectedKnown {
-		item.callsign = item.expectedCallsign
-		item.callsignKnown = true
+		item.handle = item.expectedHandle
+		item.handleKnown = true
 	}
 
 	membershipChanged := audioPeer && (!item.stateActive() || !item.audioEligible)
@@ -735,109 +686,62 @@ func (m *manager) peerListHandle(
 		item.responseDeadline = time.Time{}
 	}
 	item.responseReceived = true
-	listChanged := membershipChanged
-	for _, record := range records {
-		if m.candidateAdd(record, item.peerex, now) {
-			listChanged = true
-		}
+	listChanged := false
+	if !item.relay {
+		listChanged = m.discoveryEnsure().merge(
+			records,
+			func(record proto.PeerRecord) bool { return m.candidateAdd(record, item.peerex, now) },
+		)
+		listChanged = listChanged || membershipChanged
 	}
 	m.managerReady(item)
-	if listChanged {
+	if listChanged && !item.peerex {
 		m.peerListBroadcast()
 	}
 
 	return true
 }
 
-func (m *manager) peerListSend(item *link, requester proto.Callsign) bool {
-	records := m.peerRecords(requester)
-	if len(records) == 0 {
-		payload, _ := proto.PeerList(nil)
-		packet, err := item.voice.Seal(proto.Type_PeerListAudio, payload)
-		return err == nil && datagramSend(m.t.conn, item.addr, packet) == nil
-	}
-
-	for start := 0; start < len(records); start += proto.PeersPerPacket {
-		end := min(start+proto.PeersPerPacket, len(records))
-		payload, ok := proto.PeerList(records[start:end])
-		if !ok {
-			return false
-		}
-
-		packet, err := item.voice.Seal(proto.Type_PeerListAudio, payload)
-		if err != nil || datagramSend(m.t.conn, item.addr, packet) != nil {
-			return false
-		}
-	}
-
-	return true
-}
-
-func (m *manager) peerListBroadcast() {
-	for _, links := range m.links {
-		for _, item := range append([]*link(nil), links...) {
-			if item.peerex || !item.stateActive() || !item.audioEligible ||
-				!item.callsignKnown || item.voice == nil {
-				continue
-			}
-
-			m.peerListSend(item, item.callsign)
-		}
-	}
-}
-
-func (m *manager) peerRecords(exclude proto.Callsign) []proto.PeerRecord {
-	type candidate struct {
-		record  proto.PeerRecord
-		pending bool
-	}
-
-	candidates := make(map[proto.Callsign]candidate)
+func (m *manager) peerRecords(exclude proto.Handle) []proto.PeerRecord {
+	var records []proto.PeerRecord
+	seen := make(map[string]struct{})
 	for _, links := range m.links {
 		for _, item := range links {
-			if item.peerex {
+			if item.peerex || item.relay {
 				continue
 			}
 
-			var (
-				callsign proto.Callsign
-				pending  bool
-			)
+			var handle proto.Handle
 			switch {
-			case item.callsignKnown:
-				callsign = item.callsign
-
+			case item.handleKnown:
+				handle = item.handle
 			case item.expectedKnown:
-				callsign = item.expectedCallsign
-				pending = true
-
+				handle = item.expectedHandle
 			default:
 				continue
 			}
-
-			if callsign == exclude {
+			if handle == exclude {
 				continue
 			}
 
-			record, ok := proto.PeerRecordFrom(item.addr, callsign)
+			record, ok := proto.PeerRecordFrom(item.addr, handle)
 			if !ok {
 				continue
 			}
-
-			stored, exists := candidates[callsign]
-			if exists && (!pending || stored.pending) {
+			key := string(handle) + "\x00" + item.addr.String()
+			if _, exists := seen[key]; exists {
 				continue
 			}
-
-			candidates[callsign] = candidate{record: record, pending: pending}
+			seen[key] = struct{}{}
+			records = append(records, record)
 		}
 	}
-
-	records := make([]proto.PeerRecord, 0, len(candidates))
-	for _, item := range candidates {
-		records = append(records, item.record)
-	}
-
+	sort.Slice(records, func(i, j int) bool {
+		if records[i].Handle != records[j].Handle {
+			return records[i].Handle < records[j].Handle
+		}
+		return records[i].Addr().String() < records[j].Addr().String()
+	})
 	return records
 }
 
@@ -846,14 +750,14 @@ func (m *manager) candidateAdd(
 	allowReplacement bool,
 	now time.Time,
 ) bool {
-	if record.Callsign == m.cfg.callsign {
+	if record.Handle == m.cfg.handle {
 		return false
 	}
 
 	var (
-		addr       = record.Addr()
-		tracked    bool
-		superseded []*link
+		addr         = record.Addr()
+		tracked      bool
+		directExists bool
 	)
 	for _, links := range m.links {
 		for _, item := range links {
@@ -861,72 +765,75 @@ func (m *manager) candidateAdd(
 				continue
 			}
 
-			matches := (item.callsignKnown && item.callsign == record.Callsign) ||
-				(item.expectedKnown && item.expectedCallsign == record.Callsign)
+			matches := (item.handleKnown && item.handle == record.Handle) ||
+				(item.expectedKnown && item.expectedHandle == record.Handle)
 			if !matches {
 				continue
 			}
 
 			tracked = true
-			if udpAddrEqual(item.addr, addr) {
-				return false
-			}
-
-			if allowReplacement && item.expectedKnown && !item.callsignKnown {
-				superseded = append(superseded, item)
+			if !item.relay && udpAddrEqual(item.addr, addr) {
+				directExists = true
 			}
 		}
 	}
 
-	if tracked && !allowReplacement {
+	if directExists || (tracked && !allowReplacement) {
+		if allowReplacement {
+			return m.relayCandidateAdd(record.Handle, now, proto.RelayFallbackDelay)
+		}
 		return false
 	}
-
 	if !tracked {
-		if _, exists := m.seen[record.Callsign]; exists {
+		if _, exists := m.seen[record.Handle]; exists {
 			return false
 		}
 	}
 
+	directAdded := false
 	pair, err := sessioncrypto.KeyPairGenerate()
-	if err != nil {
-		return false
+	if err == nil {
+		item := &link{
+			addr:           addr,
+			pair:           pair,
+			expectedHandle: record.Handle,
+			expectedKnown:  true,
+			state:          linkState_KEX,
+			initiated:      true,
+			kexDeadline:    now.Add(proto.KEXTimeout),
+		}
+		m.seen[record.Handle] = struct{}{}
+		m.linkAdd(item)
+		m.linkKEXSend(item, now)
+		directAdded = true
 	}
 
-	for _, item := range superseded {
-		m.linkRemove(item, "endpoint superseded")
+	relayAdded := false
+	if allowReplacement {
+		relayAdded = m.relayCandidateAdd(record.Handle, now, proto.RelayFallbackDelay)
 	}
-
-	item := &link{
-		addr:             addr,
-		pair:             pair,
-		expectedCallsign: record.Callsign,
-		expectedKnown:    true,
-		state:            linkState_KEX,
-		initiated:        true,
-		kexDeadline:      now.Add(proto.KEXTimeout),
-	}
-	m.seen[record.Callsign] = struct{}{}
-	m.linkAdd(item)
-	m.linkKEXSend(item, now)
-
-	return true
+	return directAdded || relayAdded
 }
 
 func (m *manager) linkPromote(item *link, now time.Time) error {
-	if item.callsignKnown {
+	if item.handleKnown {
 		for _, links := range m.links {
 			for _, other := range append([]*link(nil), links...) {
-				if other != item && other.stateActive() && other.callsignKnown && other.callsign == item.callsign {
+				if other == item || other.peerex {
+					continue
+				}
+				matches := (other.handleKnown && other.handle == item.handle) ||
+					(other.expectedKnown && other.expectedHandle == item.handle)
+				if matches {
 					m.linkRemove(other, "replaced")
 				}
 			}
 		}
-		m.seen[item.callsign] = struct{}{}
+		m.seen[item.handle] = struct{}{}
 	}
 
-	if item.playback == nil {
-		name := fmt.Sprintf("chirik peer %s", item.addr)
+	if item.handleKnown && item.playback == nil {
+		name := fmt.Sprintf("chirik peer %s@%s", item.handle, linkEndpoint(item))
 		playback, err := m.playbackOpen(name)
 		if err != nil {
 			return fmt.Errorf("open peer playback: %w", err)
@@ -936,8 +843,8 @@ func (m *manager) linkPromote(item *link, now time.Time) error {
 
 	item.state = linkState_Active
 	item.lastSeen = now
-	if !item.connectedPrinted {
-		m.output.lineWrite(fmt.Sprintf("peer connected: %s", item.addr))
+	if item.handleKnown && !item.connectedPrinted {
+		m.output.lineWrite(fmt.Sprintf("peer connected: %s@%s", item.handle, linkEndpoint(item)))
 		item.connectedPrinted = true
 	}
 
@@ -945,25 +852,25 @@ func (m *manager) linkPromote(item *link, now time.Time) error {
 }
 
 func (m *manager) linkAdd(item *link) {
-	key := item.addr.String()
+	key := linkKey(item)
 	m.links[key] = append(m.links[key], item)
 }
 
 func (m *manager) linkRemove(item *link, reason string) {
 	var (
-		membershipChanged = !item.peerex && item.stateActive() && item.audioEligible && item.callsignKnown
-		removedCallsign   proto.Callsign
+		membershipChanged = !item.peerex && !item.relay && item.stateActive() && item.audioEligible && item.handleKnown
+		removedHandle     proto.Handle
 		removedKnown      bool
-		key               = item.addr.String()
+		key               = linkKey(item)
 		links             = m.links[key]
 	)
 	switch {
-	case item.callsignKnown:
-		removedCallsign = item.callsign
+	case item.handleKnown:
+		removedHandle = item.handle
 		removedKnown = true
 
 	case item.expectedKnown:
-		removedCallsign = item.expectedCallsign
+		removedHandle = item.expectedHandle
 		removedKnown = true
 	}
 
@@ -981,7 +888,7 @@ func (m *manager) linkRemove(item *link, reason string) {
 		m.links[key] = links
 	}
 
-	if removedKnown && removedCallsign != m.cfg.callsign {
+	if removedKnown && removedHandle != m.cfg.handle {
 		tracked := false
 		for _, trackedLinks := range m.links {
 			for _, trackedItem := range trackedLinks {
@@ -989,10 +896,10 @@ func (m *manager) linkRemove(item *link, reason string) {
 				case trackedItem.peerex:
 					continue
 
-				case trackedItem.callsignKnown && trackedItem.callsign == removedCallsign:
+				case trackedItem.handleKnown && trackedItem.handle == removedHandle:
 					tracked = true
 
-				case trackedItem.expectedKnown && trackedItem.expectedCallsign == removedCallsign:
+				case trackedItem.expectedKnown && trackedItem.expectedHandle == removedHandle:
 					tracked = true
 				}
 
@@ -1007,7 +914,7 @@ func (m *manager) linkRemove(item *link, reason string) {
 		}
 
 		if !tracked {
-			delete(m.seen, removedCallsign)
+			delete(m.seen, removedHandle)
 		}
 	}
 
@@ -1017,7 +924,7 @@ func (m *manager) linkRemove(item *link, reason string) {
 	}
 
 	if item.connectedPrinted {
-		m.output.lineWrite(fmt.Sprintf("peer removed: %s (%s)", item.addr, reason))
+		m.output.lineWrite(fmt.Sprintf("peer removed: %s@%s (%s)", item.handle, linkEndpoint(item), reason))
 	}
 
 	if membershipChanged {
@@ -1037,8 +944,15 @@ func (m *manager) linkFail(item *link, err error) {
 }
 
 func (m *manager) linkKEXSend(item *link, now time.Time) {
-	packet := proto.KEX(item.pair.Public())
-	if datagramSend(m.t.conn, item.addr, packet) != nil {
+	if item.relay {
+		target := item.expectedHandle
+		if item.handleKnown {
+			target = item.handle
+		}
+		if m.relaySend(target, proto.KEX(item.pair.Public())) != nil {
+			return
+		}
+	} else if !discoveryKEXSend(m.t.conn, item.addr, item.pair) {
 		return
 	}
 
@@ -1051,11 +965,24 @@ func (m *manager) linkRequestSend(item *link, now time.Time) {
 		return
 	}
 
-	var (
-		payload     = proto.Request(m.cfg.callsign, m.cfg.channel)
-		packet, err = item.voice.Seal(proto.Type_Request, payload)
-	)
-	if err != nil || datagramSend(m.t.conn, item.addr, packet) != nil {
+	payload, ok := proto.Request(m.cfg.handle, m.cfg.channel, m.local)
+	if !ok {
+		return
+	}
+
+	packet, err := item.voice.Seal(proto.Type_Request, payload)
+	if err != nil {
+		return
+	}
+	if item.relay {
+		target := item.expectedHandle
+		if item.handleKnown {
+			target = item.handle
+		}
+		if m.relaySend(target, packet) != nil {
+			return
+		}
+	} else if datagramSend(m.t.conn, item.addr, packet) != nil {
 		return
 	}
 
@@ -1098,7 +1025,7 @@ func (m *manager) tick(now time.Time) error {
 					m.linkRequestSend(item, now)
 				}
 
-				if !item.peerex && now.Sub(item.lastSeen) > proto.PeerTTL {
+				if !item.peerex && now.Sub(item.lastSeen) > m.discoveryEnsure().policy.ttl {
 					m.linkRemove(item, "expired")
 				}
 			}
@@ -1131,11 +1058,18 @@ func (m *manager) audioSend(payload []byte) {
 				continue
 			}
 
-			if err := datagramSend(m.t.conn, item.addr, packet); err != nil {
+			if item.relay {
+				if err := m.relaySend(item.handle, packet); err != nil {
+					m.linkRemove(item, "relay audio send failed")
+					continue
+				}
+			} else if err := datagramSend(m.t.conn, item.addr, packet); err != nil {
 				m.linkRemove(item, "audio send failed")
 				continue
 			}
 
+			item.counters.sent.Add(1)
+			item.counters.sentBytes.Add(uint64(len(packet)))
 			m.counters.sent.Add(1)
 			m.counters.sentBytes.Add(uint64(len(packet)))
 		}
@@ -1196,6 +1130,32 @@ func (m *manager) audioPeerCount() int {
 }
 
 func (m *manager) initialPeerexAddr() *net.UDPAddr { return m.cfg.peerex }
+
+func (m *manager) peerBitrates() []peerBitrate {
+	var rates []peerBitrate
+	for _, links := range m.links {
+		for _, item := range links {
+			if item.peerex || !item.stateActive() || !item.audioEligible || !item.handleKnown {
+				continue
+			}
+
+			var (
+				bytesSent     = item.counters.sentBytes.Load()
+				bytesReceived = item.counters.receivedBytes.Load()
+			)
+			rates = append(rates, peerBitrate{
+				handle:        item.handle,
+				bytesReceived: bytesReceived - item.sampledReceivedBytes,
+				bytesSent:     bytesSent - item.sampledSentBytes,
+			})
+			item.sampledSentBytes = bytesSent
+			item.sampledReceivedBytes = bytesReceived
+		}
+	}
+	sort.Slice(rates, func(i, j int) bool { return rates[i].handle < rates[j].handle })
+
+	return rates
+}
 
 func (m *manager) close() {
 	for _, links := range m.links {
@@ -1321,12 +1281,7 @@ func report(ctx context.Context, events chan<- error, err error) {
 	}
 }
 
-func (o *output) bitrateWrite(
-	bytesReceived uint64,
-	bytesSent uint64,
-	elapsed time.Duration,
-	peers int,
-) {
+func (o *output) bitrateWrite(rates []peerBitrate, elapsed time.Duration) {
 	if elapsed <= 0 {
 		return
 	}
@@ -1335,19 +1290,27 @@ func (o *output) bitrateWrite(
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
-	fmt.Fprintf(
-		o.writer,
-		terminalLineClear+"peers %3d | in %8.2f kbit/s | out %8.2f kbit/s",
-		peers,
-		float64(bytesReceived)*factor,
-		float64(bytesSent)*factor,
-	)
+	o.bitrateClearLocked()
+	for i, rate := range rates {
+		if i != 0 {
+			fmt.Fprint(o.writer, "\n")
+		}
+		fmt.Fprintf(
+			o.writer,
+			terminalLineClear+"%-16s | in %8.2f kbit/s | out %8.2f kbit/s",
+			rate.handle,
+			float64(rate.bytesReceived)*factor,
+			float64(rate.bytesSent)*factor,
+		)
+	}
+	o.bitrateLines = len(rates)
 }
 
 func (o *output) lineWrite(message string) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
+	o.bitrateClearLocked()
 	fmt.Fprintf(o.writer, terminalLineClear+"%s\n", message)
 }
 
@@ -1355,7 +1318,21 @@ func (o *output) lineClear() {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
-	fmt.Fprint(o.writer, terminalLineClear)
+	if o.bitrateLines == 0 {
+		fmt.Fprint(o.writer, terminalLineClear)
+		return
+	}
+	o.bitrateClearLocked()
+}
+
+func (o *output) bitrateClearLocked() {
+	for i := 0; i < o.bitrateLines; i++ {
+		fmt.Fprint(o.writer, terminalLineClear)
+		if i+1 < o.bitrateLines {
+			fmt.Fprint(o.writer, terminalCursorUp)
+		}
+	}
+	o.bitrateLines = 0
 }
 
 func datagramSend(conn *net.UDPConn, addr *net.UDPAddr, packet []byte) error {
@@ -1371,6 +1348,21 @@ func datagramSend(conn *net.UDPConn, addr *net.UDPAddr, packet []byte) error {
 	return nil
 }
 
+func localEndpoint(conn *net.UDPConn, remote *net.UDPAddr) (*net.UDPAddr, error) {
+	probe, err := net.DialUDP("udp4", nil, remote)
+	if err != nil {
+		return nil, err
+	}
+	local := probe.LocalAddr().(*net.UDPAddr)
+	probe.Close()
+
+	listen := conn.LocalAddr().(*net.UDPAddr)
+	ip := local.IP.To4()
+	if ip == nil || ip.IsUnspecified() || listen.Port == 0 {
+		return nil, errors.New("no routable IPv4 endpoint")
+	}
+	return &net.UDPAddr{IP: append(net.IP(nil), ip...), Port: listen.Port}, nil
+}
 func addrCopy(addr *net.UDPAddr) *net.UDPAddr {
 	return &net.UDPAddr{
 		IP:   append(net.IP(nil), addr.IP...),

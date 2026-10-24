@@ -3,8 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"io"
+	"log"
 	"net"
 	"strings"
 	"sync"
@@ -17,56 +17,11 @@ import (
 	"chirik/internal/proto"
 )
 
-func TestRunMintPrefix(t *testing.T) {
-	var (
-		stdout bytes.Buffer
-		stderr bytes.Buffer
-	)
-
-	if code := run([]string{"mint", "Echo"}, &stdout, &stderr); code != 0 {
-		t.Fatalf("run = %d: %s", code, stderr.String())
-	}
-
-	var (
-		text         = strings.TrimSpace(stdout.String())
-		decoded, err = base64.StdEncoding.DecodeString(text)
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if len(decoded) != proto.CallsignBytes || !strings.HasPrefix(text, "Echo") {
-		t.Fatalf("minted callsign = %q", text)
-	}
-}
-
-func TestCallsignMintRejectsInvalidPrefix(t *testing.T) {
-	if _, err := callsignMint("not-valid_", strings.NewReader(strings.Repeat("x", proto.CallsignBytes))); err == nil {
-		t.Fatal("invalid prefix accepted")
-	}
-}
-
-func TestBase64FixedDecodeRejectsNonCanonicalValue(t *testing.T) {
-	text := []byte(base64.StdEncoding.EncodeToString(make([]byte, proto.CallsignBytes)))
-	text[len(text)-2] = 'B'
-
-	var callsign proto.Callsign
-	if base64FixedDecode(callsign[:], string(text)) {
-		t.Fatal("non-canonical base64 accepted")
-	}
-}
-
 func TestConfigParseChirp(t *testing.T) {
-	var (
-		stderr   bytes.Buffer
-		callsign = base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{1}, proto.CallsignBytes))
-		channel  = base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0xff}, proto.ChannelBytes))
-	)
-
+	var stderr bytes.Buffer
 	cfg, ok := configParse(
 		[]string{
-			callsign,
-			"127.0.0.1:7777/" + channel,
+			"Alice42@127.0.0.1:7777/free-form/channel",
 			"--source=capture",
 			"--sink=playback",
 		},
@@ -76,33 +31,57 @@ func TestConfigParseChirp(t *testing.T) {
 		t.Fatalf("parse failed: %s", stderr.String())
 	}
 
-	if cfg.peerex.String() != "127.0.0.1:7777" || cfg.source != "capture" || cfg.sink != "playback" {
+	if cfg.handle != "Alice42" || cfg.channel != "free-form/channel" ||
+		cfg.channelKey != proto.ChannelKey("free-form/channel") ||
+		cfg.peerex.String() != "127.0.0.1:7777" || cfg.source != "capture" || cfg.sink != "playback" {
 		t.Fatalf("config = %+v", cfg)
-	}
-
-	if base64.StdEncoding.EncodeToString(cfg.callsign[:]) != callsign ||
-		base64.StdEncoding.EncodeToString(cfg.channel[:]) != channel {
-		t.Fatal("callsign or channel differs")
 	}
 }
 
 func TestConfigParseRejectsInvalidArguments(t *testing.T) {
-	var (
-		callsign = base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{1}, proto.CallsignBytes))
-		channel  = base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{2}, proto.ChannelBytes))
-	)
-
 	for _, args := range [][]string{
-		{"short", "127.0.0.1:7777/" + channel},
-		{callsign, "127.0.0.1:7777/short"},
-		{callsign, channel},
-		{callsign, "127.0.0.1:7777/" + channel, "--peer=127.0.0.1:9001"},
-		{callsign, "127.0.0.1:7777/" + channel, "--listen=:9000"},
+		nil,
+		{"bad-handle@127.0.0.1:7777/room"},
+		{strings.Repeat("A", proto.MaxHandleBytes+1) + "@127.0.0.1:7777/room"},
+		{"Alice@127.0.0.1:7777/"},
+		{"Alice@127.0.0.1:7777/" + strings.Repeat("x", proto.MaxPayload-len("Alice"))},
+		{"Alice127.0.0.1:7777/room"},
+		{"Alice@127.0.0.1/room"},
+		{"Alice@127.0.0.1:7777/room", "--peer=127.0.0.1:9001"},
 	} {
 		var stderr bytes.Buffer
 		if _, ok := configParse(args, &stderr); ok {
 			t.Fatalf("invalid arguments accepted: %v", args)
 		}
+	}
+}
+
+func TestLocalEndpointUsesRouteAddressAndListeningPort(t *testing.T) {
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	remote := udpListen(t)
+	defer remote.Close()
+
+	local, err := localEndpoint(conn, remote.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	listenPort := conn.LocalAddr().(*net.UDPAddr).Port
+	if !local.IP.Equal(net.IPv4(127, 0, 0, 1)) || local.Port != listenPort {
+		t.Fatalf("local endpoint = %s, want 127.0.0.1:%d", local, listenPort)
+	}
+}
+
+func TestRunRejectsRemovedMintCommand(t *testing.T) {
+	var (
+		stdout bytes.Buffer
+		stderr bytes.Buffer
+	)
+	if code := run([]string{"mint", "Echo"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("run = %d", code)
 	}
 }
 
@@ -112,18 +91,136 @@ func TestOutput(t *testing.T) {
 		out    = output{writer: &stdout}
 	)
 
-	out.bitrateWrite(13400, 26800, time.Second, 2)
-	want := terminalLineClear +
-		"peers   2 | in   107.20 kbit/s | out   214.40 kbit/s"
+	out.bitrateWrite(
+		[]peerBitrate{
+			{handle: "Alice", bytesReceived: 13400, bytesSent: 26800},
+			{handle: "Bob", bytesReceived: 6700, bytesSent: 13400},
+		},
+		time.Second,
+	)
+	want := terminalLineClear + "Alice            | in   107.20 kbit/s | out   214.40 kbit/s\n" +
+		terminalLineClear + "Bob              | in    53.60 kbit/s | out   107.20 kbit/s"
 	if stdout.String() != want {
 		t.Fatalf("bitrate output = %q, want %q", stdout.String(), want)
 	}
 
 	stdout.Reset()
+	out.bitrateWrite(
+		[]peerBitrate{{handle: "Alice", bytesReceived: 6700, bytesSent: 13400}},
+		time.Second,
+	)
+	want = terminalLineClear + terminalCursorUp + terminalLineClear +
+		terminalLineClear + "Alice            | in    53.60 kbit/s | out   107.20 kbit/s"
+	if stdout.String() != want {
+		t.Fatalf("bitrate redraw = %q, want %q", stdout.String(), want)
+	}
+
+	stdout.Reset()
 	out.lineWrite("muted")
-	want = terminalLineClear + "muted\n"
+	want = terminalLineClear + terminalLineClear + "muted\n"
 	if stdout.String() != want {
 		t.Fatalf("status output = %q, want %q", stdout.String(), want)
+	}
+
+	stdout.Reset()
+	out.bitrateWrite(nil, time.Second)
+	if stdout.Len() != 0 {
+		t.Fatalf("empty bitrate output = %q", stdout.String())
+	}
+}
+
+func TestManagerPeerBitrates(t *testing.T) {
+	m := &manager{links: make(map[string][]*link)}
+	alice := &link{
+		addr:          &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1001},
+		handle:        "Alice",
+		handleKnown:   true,
+		state:         linkState_Active,
+		audioEligible: true,
+	}
+	bob := &link{
+		addr:          &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1002},
+		handle:        "Bob",
+		handleKnown:   true,
+		state:         linkState_Active,
+		audioEligible: true,
+	}
+	peerex := &link{
+		addr:          &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1003},
+		handle:        "Exchange",
+		handleKnown:   true,
+		state:         linkState_Active,
+		audioEligible: true,
+		peerex:        true,
+	}
+	inactive := &link{
+		addr:        &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1004},
+		handle:      "Inactive",
+		handleKnown: true,
+	}
+	for _, item := range []*link{bob, peerex, inactive, alice} {
+		m.linkAdd(item)
+	}
+
+	alice.counters.receivedBytes.Add(2000)
+	alice.counters.sentBytes.Add(1000)
+	bob.counters.receivedBytes.Add(4000)
+	bob.counters.sentBytes.Add(3000)
+	peerex.counters.receivedBytes.Add(6000)
+	peerex.counters.sentBytes.Add(5000)
+
+	rates := m.peerBitrates()
+	if len(rates) != 2 ||
+		rates[0] != (peerBitrate{handle: "Alice", bytesReceived: 2000, bytesSent: 1000}) ||
+		rates[1] != (peerBitrate{handle: "Bob", bytesReceived: 4000, bytesSent: 3000}) {
+		t.Fatalf("first peer bitrates = %+v", rates)
+	}
+
+	alice.counters.receivedBytes.Add(200)
+	alice.counters.sentBytes.Add(100)
+	bob.counters.receivedBytes.Add(400)
+	bob.counters.sentBytes.Add(300)
+	rates = m.peerBitrates()
+	if len(rates) != 2 ||
+		rates[0] != (peerBitrate{handle: "Alice", bytesReceived: 200, bytesSent: 100}) ||
+		rates[1] != (peerBitrate{handle: "Bob", bytesReceived: 400, bytesSent: 300}) {
+		t.Fatalf("delta peer bitrates = %+v", rates)
+	}
+}
+
+func TestManagerLinkLabelsUseHandle(t *testing.T) {
+	var (
+		stdout  bytes.Buffer
+		factory = &playbackTestFactory{written: make(chan struct{})}
+		m       = &manager{
+			playbackOpen: factory.open,
+			output:       &output{writer: &stdout},
+			links:        make(map[string][]*link),
+			seen:         make(map[proto.Handle]struct{}),
+		}
+		item = &link{
+			addr:        &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 7777},
+			handle:      "Alice",
+			handleKnown: true,
+		}
+	)
+	m.linkAdd(item)
+	if err := m.linkPromote(item, time.Unix(100, 0)); err != nil {
+		t.Fatal(err)
+	}
+
+	if names := factory.streamNames(); len(names) != 1 || names[0] != "chirik peer Alice@127.0.0.1:7777" {
+		t.Fatalf("playback names = %q", names)
+	}
+	want := terminalLineClear + "peer connected: Alice@127.0.0.1:7777\n"
+	if stdout.String() != want {
+		t.Fatalf("connect output = %q, want %q", stdout.String(), want)
+	}
+
+	m.linkRemove(item, "test")
+	want += terminalLineClear + "peer removed: Alice@127.0.0.1:7777 (test)\n"
+	if stdout.String() != want {
+		t.Fatalf("remove output = %q, want %q", stdout.String(), want)
 	}
 }
 
@@ -137,23 +234,25 @@ func TestManagerPeerHandshakeAndAudio(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	var channel proto.Channel
-	channel[0] = 0x42
+	channel := "room"
 	managerA, playbackA := managerTestNew(
-		ctx, transportA, callsignWithByte(0xa1), channel, "127.0.0.1:1",
+		ctx, transportA, handleWithByte(0xa1), channel, "127.0.0.1:1",
 	)
 	managerB, playbackB := managerTestNew(
-		ctx, transportB, callsignWithByte(0xb2), channel, "127.0.0.1:1",
+		ctx, transportB, handleWithByte(0xb2), channel, "127.0.0.1:1",
 	)
 
 	record, ok := proto.PeerRecordFrom(
 		connB.LocalAddr().(*net.UDPAddr),
-		callsignWithByte(0xb2),
+		handleWithByte(0xb2),
 	)
 	if !ok {
 		t.Fatal("peer record rejected")
 	}
 	managerA.candidateAdd(record, false, time.Now())
+	if len(managerB.links) != 0 {
+		t.Fatalf("passive manager started with links: %+v", managerB.links)
+	}
 
 	var (
 		errorsA = make(chan error, 1)
@@ -183,11 +282,213 @@ func TestManagerPeerHandshakeAndAudio(t *testing.T) {
 	if err := <-errorsB; err != nil {
 		t.Fatal(err)
 	}
+	learned := managerB.links[connA.LocalAddr().String()]
+	if len(learned) != 1 || !learned[0].handleKnown ||
+		learned[0].handle != handleWithByte(0xa1) || !learned[0].stateActive() {
+		t.Fatalf("passive manager learned links = %+v", learned)
+	}
 	managerA.close()
 	managerB.close()
 }
 
-func TestManagerCandidateDeduplicatesCallsign(t *testing.T) {
+func TestManagerExchangePrefersDirectHandshakeAndAudio(t *testing.T) {
+	serverConn := udpListen(t)
+	exchangePair := testKeyPair(t)
+	exchange := &exchangeServer{
+		conn:     serverConn,
+		logger:   log.New(io.Discard, "", 0),
+		pair:     exchangePair,
+		entries:  make(map[string]map[proto.Handle]*exchangeEntry),
+		sessions: make(map[string][]*exchangeSession),
+	}
+	served := make(chan error, 1)
+	go func() { served <- exchange.serve() }()
+	defer func() {
+		serverConn.Close()
+		if err := <-served; err != nil {
+			t.Errorf("serve: %v", err)
+		}
+	}()
+
+	connA := udpListen(t)
+	transportA := transportStart(connA)
+	defer transportStop(transportA)
+	connB := udpListen(t)
+	transportB := transportStart(connB)
+	defer transportStop(transportB)
+	ctxA, cancelA := context.WithCancel(context.Background())
+	defer cancelA()
+	ctxB, cancelB := context.WithCancel(context.Background())
+	defer cancelB()
+	channel := "direct-preferred-room"
+	handleA := handleWithByte(0xa1)
+	handleB := handleWithByte(0xb2)
+	serverAddr := serverConn.LocalAddr().String()
+	managerA, playbackA := managerTestNew(ctxA, transportA, handleA, channel, serverAddr)
+	managerB, playbackB := managerTestNew(ctxB, transportB, handleB, channel, serverAddr)
+
+	start := func(manager *manager) <-chan error {
+		t.Helper()
+		initial, err := manager.initialLink()
+		if err != nil {
+			t.Fatal(err)
+		}
+		manager.linkAdd(initial)
+		manager.linkKEXSend(initial, time.Now())
+		errors := make(chan error, 1)
+		go func() { errors <- manager.run() }()
+		return errors
+	}
+	errorsA := start(managerA)
+	waitClosed(t, managerA.readyCh, "manager A exchange registration")
+	errorsB := start(managerB)
+	waitClosed(t, managerB.readyCh, "manager B exchange registration")
+	waitCondition(
+		t,
+		func() bool { return playbackA.streamCount() == 1 && playbackB.streamCount() == 1 },
+		"relayed peer sessions",
+	)
+
+	managerA.frames <- make([]byte, proto.PlainFrame)
+	waitClosed(t, playbackB.written, "relayed manager B playback")
+	if playbackB.bytesWritten() != proto.FrameSamples*2 {
+		t.Fatalf("relayed playback B bytes = %d", playbackB.bytesWritten())
+	}
+
+	cancelA()
+	cancelB()
+	if err := <-errorsA; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-errorsB; err != nil {
+		t.Fatal(err)
+	}
+	if links := managerA.links[relayLinkKey(handleB)]; len(links) != 0 {
+		t.Fatalf("manager A retained fallback relay links = %+v", links)
+	}
+	if links := managerB.links[relayLinkKey(handleA)]; len(links) != 0 {
+		t.Fatalf("manager B retained fallback relay links = %+v", links)
+	}
+	directActive := func(manager *manager, handle proto.Handle) bool {
+		for _, links := range manager.links {
+			for _, item := range links {
+				if !item.peerex && !item.relay && item.stateActive() &&
+					item.handleKnown && item.handle == handle {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	if !directActive(managerA, handleB) || !directActive(managerB, handleA) {
+		t.Fatal("direct path did not win before relay fallback")
+	}
+	managerA.close()
+	managerB.close()
+}
+
+func TestManagerExchangeFallsBackToRelay(t *testing.T) {
+	serverConn := udpListen(t)
+	exchangePair := testKeyPair(t)
+	exchange := &exchangeServer{
+		conn:     serverConn,
+		logger:   log.New(io.Discard, "", 0),
+		pair:     exchangePair,
+		entries:  make(map[string]map[proto.Handle]*exchangeEntry),
+		sessions: make(map[string][]*exchangeSession),
+	}
+	exchange.endpointRecords = func(
+		_ *net.UDPAddr,
+		_ *net.UDPAddr,
+		handle proto.Handle,
+	) []proto.PeerRecord {
+		return []proto.PeerRecord{{
+			IP:     [4]byte{192, 0, 2, 123},
+			Port:   40000,
+			Handle: handle,
+		}}
+	}
+	served := make(chan error, 1)
+	go func() { served <- exchange.serve() }()
+	defer func() {
+		serverConn.Close()
+		if err := <-served; err != nil {
+			t.Errorf("serve: %v", err)
+		}
+	}()
+
+	connA := udpListen(t)
+	transportA := transportStart(connA)
+	defer transportStop(transportA)
+	connB := udpListen(t)
+	transportB := transportStart(connB)
+	defer transportStop(transportB)
+	ctxA, cancelA := context.WithCancel(context.Background())
+	defer cancelA()
+	ctxB, cancelB := context.WithCancel(context.Background())
+	defer cancelB()
+	channel := "relay-fallback-room"
+	handleA := handleWithByte(0xa1)
+	handleB := handleWithByte(0xb2)
+	serverAddr := serverConn.LocalAddr().String()
+	managerA, playbackA := managerTestNew(ctxA, transportA, handleA, channel, serverAddr)
+	managerB, playbackB := managerTestNew(ctxB, transportB, handleB, channel, serverAddr)
+
+	start := func(manager *manager) <-chan error {
+		t.Helper()
+		initial, err := manager.initialLink()
+		if err != nil {
+			t.Fatal(err)
+		}
+		manager.linkAdd(initial)
+		manager.linkKEXSend(initial, time.Now())
+		errors := make(chan error, 1)
+		go func() { errors <- manager.run() }()
+		return errors
+	}
+	errorsA := start(managerA)
+	waitClosed(t, managerA.readyCh, "manager A exchange registration")
+	fallbackStart := time.Now()
+	errorsB := start(managerB)
+	waitClosed(t, managerB.readyCh, "manager B exchange registration")
+	waitCondition(
+		t,
+		func() bool { return playbackA.streamCount() == 1 && playbackB.streamCount() == 1 },
+		"relay fallback peer sessions",
+	)
+	if elapsed := time.Since(fallbackStart); elapsed < proto.RelayFallbackDelay-250*time.Millisecond {
+		t.Fatalf("relay activated before direct window: %s", elapsed)
+	}
+
+	managerA.frames <- make([]byte, proto.PlainFrame)
+	waitClosed(t, playbackB.written, "fallback relay playback")
+	if playbackB.bytesWritten() != proto.FrameSamples*2 {
+		t.Fatalf("fallback relay playback bytes = %d", playbackB.bytesWritten())
+	}
+
+	cancelA()
+	cancelB()
+	if err := <-errorsA; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-errorsB; err != nil {
+		t.Fatal(err)
+	}
+	linksA := managerA.links[relayLinkKey(handleB)]
+	linksB := managerB.links[relayLinkKey(handleA)]
+	if len(linksA) != 1 || !linksA[0].relay || !linksA[0].stateActive() ||
+		linksA[0].handle != handleB {
+		t.Fatalf("manager A fallback relay links = %+v", linksA)
+	}
+	if len(linksB) != 1 || !linksB[0].relay || !linksB[0].stateActive() ||
+		linksB[0].handle != handleA {
+		t.Fatalf("manager B fallback relay links = %+v", linksB)
+	}
+	managerA.close()
+	managerB.close()
+}
+
+func TestManagerCandidateDeduplicatesHandle(t *testing.T) {
 	conn := udpListen(t)
 	transport := transportStart(conn)
 	defer transportStop(transport)
@@ -197,9 +498,9 @@ func TestManagerCandidateDeduplicatesCallsign(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	manager, _ := managerTestNew(
-		ctx, transport, callsignWithByte(1), proto.Channel{}, target.LocalAddr().String(),
+		ctx, transport, handleWithByte(1), "room", target.LocalAddr().String(),
 	)
-	record, ok := proto.PeerRecordFrom(target.LocalAddr().(*net.UDPAddr), callsignWithByte(2))
+	record, ok := proto.PeerRecordFrom(target.LocalAddr().(*net.UDPAddr), handleWithByte(2))
 	if !ok {
 		t.Fatal("peer record rejected")
 	}
@@ -227,9 +528,9 @@ func TestManagerRemovedCandidateCanBeRediscovered(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	manager, _ := managerTestNew(
-		ctx, transport, callsignWithByte(1), proto.Channel{}, "127.0.0.1:1",
+		ctx, transport, handleWithByte(1), "room", "127.0.0.1:1",
 	)
-	record, ok := proto.PeerRecordFrom(target.LocalAddr().(*net.UDPAddr), callsignWithByte(2))
+	record, ok := proto.PeerRecordFrom(target.LocalAddr().(*net.UDPAddr), handleWithByte(2))
 	if !ok {
 		t.Fatal("peer record rejected")
 	}
@@ -242,22 +543,32 @@ func TestManagerRemovedCandidateCanBeRediscovered(t *testing.T) {
 		t.Fatal("initial peer list rejected")
 	}
 
-	first := manager.links[target.LocalAddr().String()][0]
-	manager.linkRemove(first, "test failure")
-	if _, exists := manager.seen[record.Callsign]; exists {
-		t.Fatal("removed candidate remained permanently seen")
+	key := relayLinkKey(record.Handle)
+	firstRelayLinks := manager.links[key]
+	firstDirectLinks := manager.links[target.LocalAddr().String()]
+	if len(firstRelayLinks) != 1 || !firstRelayLinks[0].relay || len(firstDirectLinks) != 1 {
+		t.Fatalf("initial direct/relay candidates = direct:%+v relay:%+v", firstDirectLinks, firstRelayLinks)
+	}
+	firstRelay := firstRelayLinks[0]
+	firstDirect := firstDirectLinks[0]
+	manager.linkRemove(firstDirect, "test failure")
+	manager.linkRemove(firstRelay, "test failure")
+	if _, exists := manager.seen[record.Handle]; exists {
+		t.Fatal("removed candidates remained permanently seen")
 	}
 	if !manager.peerListHandle(peerex, payload, false, time.Now()) {
 		t.Fatal("repeat peer list rejected")
 	}
 
-	links := manager.links[target.LocalAddr().String()]
-	if len(links) != 1 || links[0] == first {
-		t.Fatalf("rediscovered candidate links = %+v", links)
+	relayLinks := manager.links[key]
+	directLinks := manager.links[target.LocalAddr().String()]
+	if len(relayLinks) != 1 || relayLinks[0] == firstRelay || !relayLinks[0].relay ||
+		len(directLinks) != 1 || directLinks[0] == firstDirect {
+		t.Fatalf("rediscovered candidates = direct:%+v relay:%+v", directLinks, relayLinks)
 	}
 }
 
-func TestManagerPeerExchangeUpdatesKnownCallsignEndpoint(t *testing.T) {
+func TestManagerPeerExchangeUpdatesKnownHandleEndpoint(t *testing.T) {
 	var (
 		conn      = udpListen(t)
 		transport = transportStart(conn)
@@ -271,20 +582,20 @@ func TestManagerPeerExchangeUpdatesKnownCallsignEndpoint(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	manager, _ := managerTestNew(
-		ctx, transport, callsignWithByte(1), proto.Channel{}, "127.0.0.1:1",
+		ctx, transport, handleWithByte(1), "room", "127.0.0.1:1",
 	)
-	callsign := callsignWithByte(2)
+	handle := handleWithByte(2)
 	oldItem := &link{
 		addr:          addrCopy(oldTarget.LocalAddr().(*net.UDPAddr)),
-		callsign:      callsign,
-		callsignKnown: true,
+		handle:        handle,
+		handleKnown:   true,
 		state:         linkState_Active,
 		audioEligible: true,
 	}
 	manager.linkAdd(oldItem)
-	manager.seen[callsign] = struct{}{}
+	manager.seen[handle] = struct{}{}
 
-	record, ok := proto.PeerRecordFrom(newTarget.LocalAddr().(*net.UDPAddr), callsign)
+	record, ok := proto.PeerRecordFrom(newTarget.LocalAddr().(*net.UDPAddr), handle)
 	if !ok {
 		t.Fatal("replacement peer record rejected")
 	}
@@ -297,28 +608,103 @@ func TestManagerPeerExchangeUpdatesKnownCallsignEndpoint(t *testing.T) {
 		t.Fatal("replacement peer list rejected")
 	}
 
+	relayLinks := manager.links[relayLinkKey(handle)]
 	newLinks := manager.links[newTarget.LocalAddr().String()]
-	if len(newLinks) != 1 || !newLinks[0].expectedKnown || newLinks[0].expectedCallsign != callsign {
-		t.Fatalf("replacement candidate = %+v", newLinks)
+	if len(relayLinks) != 1 || !relayLinks[0].relay ||
+		!relayLinks[0].expectedKnown || relayLinks[0].expectedHandle != handle {
+		t.Fatalf("replacement relay candidate = %+v", relayLinks)
+	}
+	if len(newLinks) != 1 || !newLinks[0].expectedKnown || newLinks[0].expectedHandle != handle {
+		t.Fatalf("replacement direct candidate = %+v", newLinks)
 	}
 	if len(manager.links[oldTarget.LocalAddr().String()]) != 1 {
 		t.Fatal("old peer removed before replacement authentication")
 	}
 	if _, ok := proto.KEXParse(udpRead(t, newTarget)); !ok {
-		t.Fatal("replacement endpoint did not receive KEX")
+		t.Fatal("replacement direct endpoint did not receive KEX")
 	}
 
-	records := manager.peerRecords(manager.cfg.callsign)
-	if len(records) != 1 || records[0].Callsign != callsign ||
-		records[0].Addr().String() != newTarget.LocalAddr().String() {
-		t.Fatalf("replacement snapshot = %+v", records)
+	records := manager.peerRecords(manager.cfg.handle)
+	addresses := make(map[string]bool, len(records))
+	for _, record := range records {
+		addresses[record.Addr().String()] = true
+	}
+	if len(records) != 2 || !addresses[oldTarget.LocalAddr().String()] ||
+		!addresses[newTarget.LocalAddr().String()] {
+		t.Fatalf("hybrid replacement snapshot = %+v", records)
 	}
 
 	if !manager.peerListHandle(peerex, payload, false, time.Now()) {
 		t.Fatal("duplicate replacement peer list rejected")
 	}
-	if len(manager.links[newTarget.LocalAddr().String()]) != 1 {
-		t.Fatal("duplicate replacement candidate created")
+	if len(manager.links[relayLinkKey(handle)]) != 1 ||
+		len(manager.links[newTarget.LocalAddr().String()]) != 1 {
+		t.Fatal("duplicate hybrid candidates created")
+	}
+}
+
+func TestManagerAuthoritativeCandidatesRaceAndFirstPromotionWins(t *testing.T) {
+	conn := udpListen(t)
+	transport := transportStart(conn)
+	defer transportStop(transport)
+	publicTarget := udpListen(t)
+	defer publicTarget.Close()
+	localTarget := udpListen(t)
+	defer localTarget.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	manager, _ := managerTestNew(
+		ctx, transport, handleWithByte(1), "room", "127.0.0.1:1",
+	)
+	handle := handleWithByte(2)
+	publicRecord, ok := proto.PeerRecordFrom(publicTarget.LocalAddr().(*net.UDPAddr), handle)
+	if !ok {
+		t.Fatal("public candidate rejected")
+	}
+	localRecord, ok := proto.PeerRecordFrom(localTarget.LocalAddr().(*net.UDPAddr), handle)
+	if !ok {
+		t.Fatal("local candidate rejected")
+	}
+	payload, ok := proto.PeerList([]proto.PeerRecord{publicRecord, localRecord})
+	if !ok {
+		t.Fatal("candidate peer list rejected")
+	}
+
+	peerex := &link{peerex: true}
+	if !manager.peerListHandle(peerex, payload, false, time.Now()) {
+		t.Fatal("authoritative candidate list rejected")
+	}
+	relayLinks := manager.links[relayLinkKey(handle)]
+	publicLinks := manager.links[publicTarget.LocalAddr().String()]
+	localLinks := manager.links[localTarget.LocalAddr().String()]
+	if len(relayLinks) != 1 || !relayLinks[0].relay ||
+		len(publicLinks) != 1 || len(localLinks) != 1 {
+		t.Fatalf(
+			"authoritative hybrid candidates = public:%+v local:%+v relay:%+v",
+			publicLinks, localLinks, relayLinks,
+		)
+	}
+	if _, ok := proto.KEXParse(udpRead(t, publicTarget)); !ok {
+		t.Fatal("public candidate did not receive KEX")
+	}
+	if _, ok := proto.KEXParse(udpRead(t, localTarget)); !ok {
+		t.Fatal("local candidate did not receive KEX")
+	}
+
+	winner := localLinks[0]
+	winner.handle = handle
+	winner.handleKnown = true
+	if err := manager.linkPromote(winner, time.Now()); err != nil {
+		t.Fatalf("promote local candidate: %v", err)
+	}
+	if len(manager.links[publicTarget.LocalAddr().String()]) != 0 ||
+		len(manager.links[relayLinkKey(handle)]) != 0 {
+		t.Fatal("losing public/relay candidates retained")
+	}
+	remaining := manager.links[localTarget.LocalAddr().String()]
+	if len(remaining) != 1 || remaining[0] != winner || !winner.stateActive() {
+		t.Fatalf("winning local candidate = %+v", remaining)
 	}
 }
 
@@ -332,7 +718,7 @@ func TestManagerPendingCandidateRepliesToKEX(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	manager, _ := managerTestNew(
-		ctx, transport, callsignWithByte(1), proto.Channel{2}, "127.0.0.1:1",
+		ctx, transport, handleWithByte(1), "room", "127.0.0.1:1",
 	)
 
 	pair, err := sessioncrypto.KeyPairGenerate()
@@ -377,25 +763,25 @@ func TestManagerPeerListBroadcasts(t *testing.T) {
 	defer cancel()
 	var (
 		manager, _ = managerTestNew(
-			ctx, transport, callsignWithByte(1), proto.Channel{2}, "127.0.0.1:1",
+			ctx, transport, handleWithByte(1), "room", "127.0.0.1:1",
 		)
 		clientA, remoteA = sessionTestPair(t, 1)
 		clientB, remoteB = sessionTestPair(t, 3)
-		callsignA        = callsignWithByte(0xa1)
-		callsignB        = callsignWithByte(0xb2)
+		handleA          = handleWithByte(0xa1)
+		handleB          = handleWithByte(0xb2)
 		itemA            = &link{
 			addr:          addrCopy(targetA.LocalAddr().(*net.UDPAddr)),
 			voice:         clientA,
-			callsign:      callsignA,
-			callsignKnown: true,
+			handle:        handleA,
+			handleKnown:   true,
 			state:         linkState_Active,
 			audioEligible: true,
 		}
 		itemB = &link{
 			addr:          addrCopy(targetB.LocalAddr().(*net.UDPAddr)),
 			voice:         clientB,
-			callsign:      callsignB,
-			callsignKnown: true,
+			handle:        handleB,
+			handleKnown:   true,
 			state:         linkState_Active,
 			audioEligible: true,
 		}
@@ -405,14 +791,14 @@ func TestManagerPeerListBroadcasts(t *testing.T) {
 	manager.peerListBroadcast()
 
 	for _, test := range []struct {
-		name             string
-		conn             *net.UDPConn
-		remote           *sessioncrypto.Session
-		expectedCallsign proto.Callsign
-		expectedAddr     string
+		name           string
+		conn           *net.UDPConn
+		remote         *sessioncrypto.Session
+		expectedHandle proto.Handle
+		expectedAddr   string
 	}{
-		{"A", targetA, remoteA, callsignB, targetB.LocalAddr().String()},
-		{"B", targetB, remoteB, callsignA, targetA.LocalAddr().String()},
+		{"A", targetA, remoteA, handleB, targetB.LocalAddr().String()},
+		{"B", targetB, remoteB, handleA, targetA.LocalAddr().String()},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			kind, _, payload, err := test.remote.Open(udpRead(t, test.conn))
@@ -421,10 +807,51 @@ func TestManagerPeerListBroadcasts(t *testing.T) {
 			}
 			records, ok := proto.PeerListParse(payload)
 			if kind != proto.Type_PeerListAudio || !ok || len(records) != 1 ||
-				records[0].Callsign != test.expectedCallsign || records[0].Addr().String() != test.expectedAddr {
+				records[0].Handle != test.expectedHandle || records[0].Addr().String() != test.expectedAddr {
 				t.Fatalf("broadcast peer list = %#x, %+v, %t", kind, records, ok)
 			}
 		})
+	}
+}
+
+func TestManagerBroadcastsPeerListToExchange(t *testing.T) {
+	var (
+		conn         = udpListen(t)
+		transport    = transportStart(conn)
+		exchangeConn = udpListen(t)
+	)
+	defer transportStop(transport)
+	defer exchangeConn.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	manager, _ := managerTestNew(
+		ctx, transport, "Alice", "room", exchangeConn.LocalAddr().String(),
+	)
+	client, remote := sessionTestPair(t, 1)
+	manager.linkAdd(&link{
+		addr:   addrCopy(exchangeConn.LocalAddr().(*net.UDPAddr)),
+		voice:  client,
+		state:  linkState_Active,
+		peerex: true,
+	})
+	manager.linkAdd(&link{
+		addr:          &net.UDPAddr{IP: net.IPv4(192, 0, 2, 10), Port: 9000},
+		handle:        "Bob",
+		handleKnown:   true,
+		state:         linkState_Active,
+		audioEligible: true,
+	})
+
+	manager.peerListBroadcast()
+	kind, _, payload, err := remote.Open(udpRead(t, exchangeConn))
+	if err != nil || kind != proto.Type_PeerListAudio {
+		t.Fatalf("exchange update = %#x/%v", kind, err)
+	}
+	records, ok := proto.PeerListParse(payload)
+	if !ok || len(records) != 1 || records[0].Handle != "Bob" ||
+		records[0].Addr().String() != "192.0.2.10:9000" {
+		t.Fatalf("exchange update peers = %+v/%t", records, ok)
 	}
 }
 
@@ -443,23 +870,24 @@ func TestManagerDiscoveredPeerBroadcasts(t *testing.T) {
 	defer cancel()
 	var (
 		manager, _ = managerTestNew(
-			ctx, transport, callsignWithByte(1), proto.Channel{2}, "127.0.0.1:1",
+			ctx, transport, handleWithByte(1), "room", "127.0.0.1:1",
 		)
 		clientA, remoteA = sessionTestPair(t, 1)
-		callsignA        = callsignWithByte(0xa1)
+		handleA          = handleWithByte(0xa1)
 		itemA            = &link{
 			addr:          addrCopy(targetA.LocalAddr().(*net.UDPAddr)),
 			voice:         clientA,
-			callsign:      callsignA,
-			callsignKnown: true,
+			handle:        handleA,
+			handleKnown:   true,
 			state:         linkState_Active,
 			audioEligible: true,
 		}
-		callsignB = callsignWithByte(0xb2)
+		handleB = handleWithByte(0xb2)
 	)
+	_ = remoteA
 	manager.linkAdd(itemA)
 
-	recordB, ok := proto.PeerRecordFrom(targetB.LocalAddr().(*net.UDPAddr), callsignB)
+	recordB, ok := proto.PeerRecordFrom(targetB.LocalAddr().(*net.UDPAddr), handleB)
 	if !ok {
 		t.Fatal("peer record rejected")
 	}
@@ -472,20 +900,12 @@ func TestManagerDiscoveredPeerBroadcasts(t *testing.T) {
 		t.Fatal("peer list rejected")
 	}
 
-	kind, _, update, err := remoteA.Open(udpRead(t, targetA))
-	if err != nil {
-		t.Fatal(err)
-	}
-	records, ok := proto.PeerListParse(update)
-	if kind != proto.Type_PeerListAudio || !ok || len(records) != 1 ||
-		records[0].Callsign != callsignB || records[0].Addr().String() != targetB.LocalAddr().String() {
-		t.Fatalf("discovered peer update = %#x, %+v, %t", kind, records, ok)
-	}
+	expectUDPTimeout(t, targetA, "relayed discovery broadcast")
 
-	links := manager.links[targetB.LocalAddr().String()]
-	if len(links) != 1 || !links[0].expectedKnown || links[0].expectedCallsign != callsignB ||
-		links[0].state != linkState_KEX {
-		t.Fatalf("discovered candidate = %+v", links)
+	links := manager.links[relayLinkKey(handleB)]
+	if len(links) != 1 || !links[0].relay || !links[0].expectedKnown ||
+		links[0].expectedHandle != handleB || links[0].state != linkState_KEX {
+		t.Fatalf("discovered relay candidate = %+v", links)
 	}
 
 	if !manager.peerListHandle(peerex, payload, false, time.Unix(101, 0)) {
@@ -515,22 +935,22 @@ func TestManagerPeerRemovalBroadcasts(t *testing.T) {
 	defer cancel()
 	var (
 		manager, _ = managerTestNew(
-			ctx, transport, callsignWithByte(1), proto.Channel{2}, "127.0.0.1:1",
+			ctx, transport, handleWithByte(1), "room", "127.0.0.1:1",
 		)
 		clientA, remoteA = sessionTestPair(t, 1)
-		callsignA        = callsignWithByte(0xa1)
+		handleA          = handleWithByte(0xa1)
 		itemA            = &link{
 			addr:          addrCopy(targetA.LocalAddr().(*net.UDPAddr)),
 			voice:         clientA,
-			callsign:      callsignA,
-			callsignKnown: true,
+			handle:        handleA,
+			handleKnown:   true,
 			state:         linkState_Active,
 			audioEligible: true,
 		}
 		itemB = &link{
 			addr:          &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 2},
-			callsign:      callsignWithByte(0xb2),
-			callsignKnown: true,
+			handle:        handleWithByte(0xb2),
+			handleKnown:   true,
 			state:         linkState_Active,
 			audioEligible: true,
 		}
@@ -561,7 +981,7 @@ func TestManagerPeerExchangeDoesNotPoll(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	manager, _ := managerTestNew(
-		ctx, transport, callsignWithByte(1), proto.Channel{2}, target.LocalAddr().String(),
+		ctx, transport, handleWithByte(1), "room", target.LocalAddr().String(),
 	)
 
 	now := time.Unix(100, 0)
@@ -627,6 +1047,7 @@ func TestTermiosRawPreservesOutputFlags(t *testing.T) {
 type playbackTestFactory struct {
 	mu      sync.Mutex
 	streams []*playbackTest
+	names   []string
 	written chan struct{}
 	once    sync.Once
 }
@@ -641,8 +1062,8 @@ type playbackTest struct {
 func managerTestNew(
 	ctx context.Context,
 	transport *transport,
-	callsign proto.Callsign,
-	channel proto.Channel,
+	handle proto.Handle,
+	channel string,
 	peerex string,
 ) (*manager, *playbackTestFactory) {
 	var (
@@ -652,29 +1073,33 @@ func managerTestNew(
 			ctx: ctx,
 			t:   transport,
 			cfg: config{
-				callsign: callsign,
-				channel:  channel,
-				peerex:   peerexAddr,
+				handle:     handle,
+				channel:    channel,
+				channelKey: proto.ChannelKey(channel),
+				peerex:     peerexAddr,
 			},
+			local:        addrCopy(transport.conn.LocalAddr().(*net.UDPAddr)),
 			playbackOpen: factory.open,
 			output:       &output{writer: io.Discard},
 			stderr:       io.Discard,
 			links:        make(map[string][]*link),
-			seen:         map[proto.Callsign]struct{}{callsign: {}},
+			seen:         map[proto.Handle]struct{}{handle: {}},
 			frames:       make(chan []byte, 8),
 			commands:     make(chan byte, 8),
 			events:       make(chan error, 8),
 			readyCh:      make(chan struct{}),
 		}
 	)
+	manager.discoveryEnsure()
 
 	return manager, factory
 }
 
-func (f *playbackTestFactory) open(string) (audio.PlaybackWriter, error) {
+func (f *playbackTestFactory) open(name string) (audio.PlaybackWriter, error) {
 	stream := &playbackTest{factory: f}
 	f.mu.Lock()
 	f.streams = append(f.streams, stream)
+	f.names = append(f.names, name)
 	f.mu.Unlock()
 
 	return stream, nil
@@ -685,6 +1110,13 @@ func (f *playbackTestFactory) streamCount() int {
 	defer f.mu.Unlock()
 
 	return len(f.streams)
+}
+
+func (f *playbackTestFactory) streamNames() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return append([]string(nil), f.names...)
 }
 
 func (f *playbackTestFactory) bytesWritten() int {
@@ -721,10 +1153,9 @@ func (p *playbackTest) Close() {
 	p.mu.Unlock()
 }
 
-func callsignWithByte(value byte) proto.Callsign {
-	var callsign proto.Callsign
-	callsign[0] = value
-	return callsign
+func handleWithByte(value byte) proto.Handle {
+	const alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
+	return proto.Handle("peer" + string(alphabet[value%byte(len(alphabet))]))
 }
 
 func waitClosed(t *testing.T, done <-chan struct{}, name string) {
