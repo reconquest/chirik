@@ -5,6 +5,15 @@ type State struct {
 	StepIndex uint8
 }
 
+const (
+	samplesPerByte    = 2
+	nibbleBits        = 4
+	nibbleMask        = 0x0f
+	adpcmEighthShift  = 3
+	adpcmQuarterShift = 2
+	predictorMax      = 32767
+)
+
 var stepTable = [...]int{
 	7, 8, 9, 10, 11, 12, 13, 14, 16, 17,
 	19, 21, 23, 25, 28, 31, 34, 37, 41, 45,
@@ -22,55 +31,61 @@ var indexTable = [...]int{
 	-1, -1, -1, -1, 2, 4, 6, 8,
 }
 
-func Encode(s *State, pcm []int16) []byte {
-	encoded := make([]byte, (len(pcm)+1)/2)
-	for i, sample := range pcm {
-		nibble := encodeSample(s, sample)
-		if i&1 == 0 {
-			encoded[i/2] = nibble
+func Encode(state *State, pcm []int16) []byte {
+	encoded := make([]byte, (len(pcm)+1)/samplesPerByte)
+	for sampleIndex, sample := range pcm {
+		nibble := encodeSample(state, sample)
+		if sampleIndex&1 == 0 {
+			encoded[sampleIndex/samplesPerByte] = nibble
 		} else {
-			encoded[i/2] |= nibble << 4
+			encoded[sampleIndex/samplesPerByte] |= nibble << nibbleBits
 		}
 	}
 
 	return encoded
 }
 
-func Decode(s State, data []byte) []int16 {
-	pcm := make([]int16, len(data)*2)
-	decode(&s, data, pcm)
+func Decode(state State, data []byte) []int16 {
+	pcm := make([]int16, len(data)*samplesPerByte)
+	decode(&state, data, pcm)
 
 	return pcm
 }
 
-func encodeSample(s *State, sample int16) byte {
-	index := clampIndex(int(s.StepIndex))
-	predictor := int(s.Predictor)
+func encodeSample(state *State, sample int16) byte {
+	index := clampIndex(int(state.StepIndex))
+	predictor := int(state.Predictor)
 	step := stepTable[index]
 	difference := int(sample) - predictor
 	nibble := byte(0)
+
 	if difference < 0 {
 		nibble = 8
 		difference = -difference
 	}
 
-	delta := step >> 3
+	delta := step >> adpcmEighthShift
 	if difference >= step {
 		nibble |= 4
+
 		difference -= step
+
 		delta += step
 	}
 
 	step >>= 1
 	if difference >= step {
 		nibble |= 2
+
 		difference -= step
+
 		delta += step
 	}
 
 	step >>= 1
 	if difference >= step {
 		nibble |= 1
+
 		delta += step
 	}
 
@@ -82,19 +97,23 @@ func encodeSample(s *State, sample int16) byte {
 
 	predictor = clampPredictor(predictor)
 	index = clampIndex(index + indexTable[nibble])
-	s.Predictor = int16(predictor)
-	s.StepIndex = uint8(index)
+	state.Predictor = int16(predictor)
+	state.StepIndex = uint8(index)
 
 	return nibble
 }
 
-func decode(s *State, data []byte, pcm []int16) {
-	index := clampIndex(int(s.StepIndex))
-	predictor := int(s.Predictor)
-	for i := range len(pcm) {
-		nibble := data[i/2] >> (4 * (i & 1)) & 0x0f
+func decode(state *State, data []byte, pcm []int16) {
+	index := clampIndex(int(state.StepIndex))
+	predictor := int(state.Predictor)
+
+	for sampleIndex := range pcm {
+		encoded := data[sampleIndex/samplesPerByte]
+		shift := nibbleBits * (sampleIndex & 1)
+		nibble := encoded >> shift & nibbleMask
 		step := stepTable[index]
-		delta := step >> 3
+		delta := step >> adpcmEighthShift
+
 		if nibble&4 != 0 {
 			delta += step
 		}
@@ -104,7 +123,7 @@ func decode(s *State, data []byte, pcm []int16) {
 		}
 
 		if nibble&1 != 0 {
-			delta += step >> 2
+			delta += step >> adpcmQuarterShift
 		}
 
 		if nibble&8 != 0 {
@@ -115,19 +134,21 @@ func decode(s *State, data []byte, pcm []int16) {
 
 		predictor = clampPredictor(predictor)
 		index = clampIndex(index + indexTable[nibble])
-		pcm[i] = int16(predictor)
+		pcm[sampleIndex] = int16(predictor)
 	}
 
-	s.Predictor = int16(predictor)
-	s.StepIndex = uint8(index)
+	state.Predictor = int16(predictor)
+	state.StepIndex = uint8(index)
 }
 
 func clampIndex(index int) int {
 	switch {
 	case index < 0:
 		return 0
-	case index > len(stepTable)-1:
+
+	case index >= len(stepTable):
 		return len(stepTable) - 1
+
 	default:
 		return index
 	}
@@ -137,8 +158,10 @@ func clampPredictor(predictor int) int {
 	switch {
 	case predictor < -32768:
 		return -32768
-	case predictor > 32767:
-		return 32767
+
+	case predictor > predictorMax:
+		return predictorMax
+
 	default:
 		return predictor
 	}

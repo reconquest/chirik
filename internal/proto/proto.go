@@ -34,7 +34,8 @@ const (
 	AudioPacketsPerSecond   = SampleRate / FrameSamples
 	AudioPayloadBitrate     = AudioPacketBytes * AudioPacketsPerSecond * 8
 	AudioIPv4UDPHeaderBytes = 20 + 8
-	AudioIPv4UDPBitrate     = (AudioPacketBytes + AudioIPv4UDPHeaderBytes) * AudioPacketsPerSecond * 8
+	AudioIPv4UDPBitrate     = (AudioPacketBytes + AudioIPv4UDPHeaderBytes) *
+		AudioPacketsPerSecond * 8
 
 	KEXInterval        = 500 * time.Millisecond
 	KEXTimeout         = 10 * time.Second
@@ -66,11 +67,7 @@ func HandleValid(handle Handle) bool {
 	}
 
 	for _, char := range []byte(handle) {
-		switch {
-		case char >= 'a' && char <= 'z':
-		case char >= 'A' && char <= 'Z':
-		case char >= '0' && char <= '9':
-		default:
+		if !handleCharValid(char) {
 			return false
 		}
 	}
@@ -78,12 +75,27 @@ func HandleValid(handle Handle) bool {
 	return true
 }
 
-func ChannelKey(channel string) [32]byte { return sha256.Sum256([]byte(channel)) }
+func handleCharValid(char byte) bool {
+	return char >= 'a' && char <= 'z' ||
+		char >= 'A' && char <= 'Z' ||
+		char >= '0' && char <= '9'
+}
+
+func ChannelKey(
+	channel string,
+) [32]byte {
+	return sha256.Sum256([]byte(channel))
+}
 
 func TypeEncrypted(kind byte) bool {
 	switch kind {
-	case Type_Audio, Type_Request, Type_PeerList, Type_PeerListAudio, Type_Relay:
+	case Type_Audio,
+		Type_Request,
+		Type_PeerList,
+		Type_PeerListAudio,
+		Type_Relay:
 		return true
+
 	default:
 		return false
 	}
@@ -91,6 +103,7 @@ func TypeEncrypted(kind byte) bool {
 
 func KEX(public [PublicKeyBytes]byte) []byte {
 	packet := make([]byte, KEXPacketBytes)
+
 	packet[0] = Type_KEX
 	copy(packet[1:], public[:])
 
@@ -120,13 +133,14 @@ func EnvelopeHeaderFor(kind byte, seq uint64) [EnvelopeHeader]byte {
 
 func EnvelopeParse(
 	packet []byte,
-) (kind byte, seq uint64, aad []byte, ciphertext []byte, ok bool) {
+) (byte, uint64, []byte, []byte, bool) {
 	if len(packet) < EnvelopeHeader+TagBytes || len(packet) > MaxDatagram {
 		return 0, 0, nil, nil, false
 	}
 
-	kind = packet[0]
-	seq = binary.BigEndian.Uint64(packet[1:EnvelopeHeader])
+	kind := packet[0]
+	seq := binary.BigEndian.Uint64(packet[1:EnvelopeHeader])
+
 	if !TypeEncrypted(kind) || seq == 0 {
 		return 0, 0, nil, nil, false
 	}
@@ -135,7 +149,7 @@ func EnvelopeParse(
 }
 
 func RequestValid(handle Handle, channel string) bool {
-	return HandleValid(handle) && len(channel) != 0 &&
+	return HandleValid(handle) && channel != "" &&
 		requestPrefixBytes+len(handle)+len(channel) <= MaxRequestPayload
 }
 
@@ -143,14 +157,17 @@ func Request(handle Handle, channel string, local *net.UDPAddr) ([]byte, bool) {
 	if local == nil || local.IP.IsUnspecified() {
 		return nil, false
 	}
+
 	localRecord, ok := PeerRecordFrom(local, handle)
 	if !ok || !RequestValid(handle, channel) {
 		return nil, false
 	}
 
 	payload := make([]byte, requestPrefixBytes+len(handle)+len(channel))
+
 	payload[0] = byte(len(handle))
 	copy(payload[1:1+len(handle)], handle)
+
 	offset := 1 + len(handle)
 	copy(payload[offset:offset+4], localRecord.IP[:])
 	binary.BigEndian.PutUint16(payload[offset+4:offset+6], localRecord.Port)
@@ -166,6 +183,7 @@ func RequestParse(payload []byte) (Handle, string, *net.UDPAddr, bool) {
 
 	handleBytes := int(payload[0])
 	offset := 1 + handleBytes
+
 	if handleBytes == 0 || offset+6 >= len(payload) {
 		return "", "", nil, false
 	}
@@ -176,9 +194,12 @@ func RequestParse(payload []byte) (Handle, string, *net.UDPAddr, bool) {
 		Handle: handle,
 	}
 	copy(localRecord.IP[:], payload[offset:offset+4])
+
 	channel := string(payload[offset+6:])
 	local := localRecord.Addr()
-	if !RequestValid(handle, channel) || localRecord.Port == 0 || local.IP.IsUnspecified() {
+
+	if !RequestValid(handle, channel) || localRecord.Port == 0 ||
+		local.IP.IsUnspecified() {
 		return "", "", nil, false
 	}
 
@@ -191,6 +212,7 @@ func Relay(handle Handle, packet []byte) ([]byte, bool) {
 	}
 
 	payload := make([]byte, relayPrefixBytes+len(handle)+len(packet))
+
 	payload[0] = byte(len(handle))
 	copy(payload[relayPrefixBytes:], handle)
 	copy(payload[relayPrefixBytes+len(handle):], packet)
@@ -205,12 +227,14 @@ func RelayParse(payload []byte) (Handle, []byte, bool) {
 
 	handleBytes := int(payload[0])
 	offset := relayPrefixBytes + handleBytes
+
 	if handleBytes == 0 || offset >= len(payload) {
 		return "", nil, false
 	}
 
 	handle := Handle(payload[relayPrefixBytes:offset])
 	packet := payload[offset:]
+
 	if !HandleValid(handle) || len(packet) > MaxRelayInner {
 		return "", nil, false
 	}
@@ -227,6 +251,7 @@ func PeerRecordFrom(addr *net.UDPAddr, handle Handle) (PeerRecord, bool) {
 	}
 
 	copy(record.IP[:], ip)
+
 	record.Port = uint16(addr.Port)
 	record.Handle = handle
 
@@ -242,6 +267,7 @@ func (r PeerRecord) Addr() *net.UDPAddr {
 
 func PeerList(records []PeerRecord) ([]byte, bool) {
 	size := 0
+
 	for _, record := range records {
 		if record.Port == 0 || !HandleValid(record.Handle) {
 			return nil, false
@@ -255,11 +281,14 @@ func PeerList(records []PeerRecord) ([]byte, bool) {
 
 	payload := make([]byte, size)
 	offset := 0
+
 	for _, record := range records {
 		copy(payload[offset:offset+4], record.IP[:])
 		binary.BigEndian.PutUint16(payload[offset+4:offset+6], record.Port)
+
 		payload[offset+6] = byte(len(record.Handle))
 		copy(payload[offset+peerRecordPrefixBytes:], record.Handle)
+
 		offset += peerRecordPrefixBytes + len(record.Handle)
 	}
 
@@ -276,7 +305,8 @@ func PeerListSplit(records []PeerRecord) ([][]byte, bool) {
 		start    int
 		size     int
 	)
-	for i, record := range records {
+
+	for recordIndex, record := range records {
 		if record.Port == 0 || !HandleValid(record.Handle) {
 			return nil, false
 		}
@@ -287,12 +317,13 @@ func PeerListSplit(records []PeerRecord) ([][]byte, bool) {
 		}
 
 		if size+recordBytes > MaxPayload {
-			payload, ok := PeerList(records[start:i])
+			payload, ok := PeerList(records[start:recordIndex])
 			if !ok {
 				return nil, false
 			}
+
 			payloads = append(payloads, payload)
-			start = i
+			start = recordIndex
 			size = 0
 		}
 
@@ -303,6 +334,7 @@ func PeerListSplit(records []PeerRecord) ([][]byte, bool) {
 	if !ok {
 		return nil, false
 	}
+
 	payloads = append(payloads, payload)
 
 	return payloads, true
@@ -314,6 +346,7 @@ func PeerListParse(payload []byte) ([]PeerRecord, bool) {
 	}
 
 	var records []PeerRecord
+
 	for offset := 0; offset < len(payload); {
 		if len(payload)-offset < peerRecordPrefixBytes {
 			return nil, false
@@ -321,6 +354,7 @@ func PeerListParse(payload []byte) ([]PeerRecord, bool) {
 
 		handleBytes := int(payload[offset+6])
 		end := offset + peerRecordPrefixBytes + handleBytes
+
 		if handleBytes == 0 || end > len(payload) {
 			return nil, false
 		}
@@ -330,6 +364,7 @@ func PeerListParse(payload []byte) ([]PeerRecord, bool) {
 			Handle: Handle(payload[offset+peerRecordPrefixBytes : end]),
 		}
 		copy(record.IP[:], payload[offset:offset+4])
+
 		if record.Port == 0 || !HandleValid(record.Handle) {
 			return nil, false
 		}

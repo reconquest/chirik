@@ -1,4 +1,5 @@
 GO ?= go
+GOLANGCI_LINT ?= golangci-lint
 
 .PHONY: all chirik test lint clean
 
@@ -12,6 +13,9 @@ test:
 
 lint:
 	$(GO) vet ./...
+	$(GO) tool karmalint ./...
+	$(GOLANGCI_LINT) run ./...
+	$(GOLANGCI_LINT) fmt --diff
 
 clean:
 	rm -f chirik chiriked

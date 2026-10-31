@@ -3,49 +3,66 @@ package main
 import (
 	"fmt"
 	"net"
-	"sort"
+	"slices"
 	"strings"
 	"time"
+
+	"github.com/reconquest/karma-go"
 
 	"chirik/internal/proto"
 )
 
-func (s *exchangeServer) peerListHandle(
+const endpointRecordsPerPeer = 2
+
+func (server *exchangeServer) peerListHandle(
 	session *exchangeSession,
 	payload []byte,
 	now time.Time,
 ) {
-	s.mu.Lock()
-	if !s.sessionContains(session) || !session.registered {
-		s.mu.Unlock()
+	server.mu.Lock()
+
+	if !server.sessionContains(session) || !session.registered {
+		server.mu.Unlock()
+
 		return
 	}
+
 	channel := session.channel
 	source := session.handle
-	s.mu.Unlock()
+	server.mu.Unlock()
 
-	records, ok := s.discoveryEnsure().decode(payload)
+	records, ok := proto.PeerListParse(payload)
 	if !ok {
 		return
 	}
-	changed := s.discoveryEnsure().merge(
+
+	changed := discoveryMerge(
 		records,
 		func(record proto.PeerRecord) bool {
-			return s.discoveryCandidateAdd(channel, source, record, now)
+			return server.discoveryCandidateAdd(channel, source, record, now)
 		},
 	)
 
-	s.mu.Lock()
-	if s.sessionContains(session) {
+	server.mu.Lock()
+
+	if server.sessionContains(session) {
 		session.seen = now
 	}
-	s.mu.Unlock()
+
+	server.mu.Unlock()
+
 	if changed {
-		s.discoveryEnsure().broadcast(channel)
+		err := server.discoveryEnsure().broadcast(channel)
+		if err != nil {
+			server.logger.Print(
+				"ERROR ",
+				karma.Format(err, "broadcast peer list"),
+			)
+		}
 	}
 }
 
-func (s *exchangeServer) discoveryCandidateAdd(
+func (server *exchangeServer) discoveryCandidateAdd(
 	channel string,
 	source proto.Handle,
 	record proto.PeerRecord,
@@ -55,77 +72,86 @@ func (s *exchangeServer) discoveryCandidateAdd(
 		return false
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	server.mu.Lock()
+	defer server.mu.Unlock()
 
-	entries := s.entries[channel]
+	entries := server.entries[channel]
 	if entries == nil {
 		entries = make(map[proto.Handle]*exchangeEntry)
-		s.entries[channel] = entries
+		server.entries[channel] = entries
 	}
 
 	stored := entries[record.Handle]
 	if stored != nil {
-		if (udpAddrEqual(stored.addr, record.Addr()) || udpAddrEqual(stored.local, record.Addr())) &&
-			stored.session == nil {
+		endpointMatches := udpAddrEqual(stored.addr, record.Addr()) ||
+			udpAddrEqual(stored.local, record.Addr())
+		if endpointMatches && stored.session == nil {
 			stored.seen = now
 		}
+
 		return false
 	}
 
 	entries[record.Handle] = &exchangeEntry{
-		addr:    record.Addr(),
-		handle:  record.Handle,
-		channel: channel,
-		seen:    now,
+		addr:   record.Addr(),
+		handle: record.Handle,
+		seen:   now,
 	}
+
 	return true
 }
 
-func (s *exchangeServer) discoveryEnsure() *discoveryEngine {
-	if s.discovery != nil {
-		return s.discovery
+func (server *exchangeServer) discoveryEnsure() *discoveryEngine {
+	if server.discovery != nil {
+		return server.discovery
 	}
 
-	s.discovery = &discoveryEngine{
-		conn: s.conn,
+	server.discovery = &discoveryEngine{
+		conn: server.conn,
 		policy: discoveryPolicy{
 			audio: false,
 			ttl:   proto.EntryTTL,
 		},
-		records:    s.discoveryRecords,
-		recipients: s.discoveryRecipients,
-		packetSent: s.discoveryPacketSent,
+		records:    server.discoveryRecords,
+		recipients: server.discoveryRecipients,
+		packetSent: server.discoveryPacketSent,
 	}
-	return s.discovery
+
+	return server.discovery
 }
 
-func (s *exchangeServer) discoveryRecords(
+func (server *exchangeServer) discoveryRecords(
 	channel string,
 	exclude proto.Handle,
 ) []proto.PeerRecord {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	server.mu.Lock()
+	defer server.mu.Unlock()
 
-	entries := s.entries[channel]
-	records := make([]proto.PeerRecord, 0, 2*len(entries))
+	entries := server.entries[channel]
+	records := make([]proto.PeerRecord, 0, endpointRecordsPerPeer*len(entries))
+
 	for _, item := range entries {
 		if item.handle == exclude {
 			continue
 		}
-		records = append(records, s.endpointRecordsFor(item.addr, item.local, item.handle)...)
+
+		records = append(
+			records,
+			server.endpointRecordsFor(item.addr, item.local, item.handle)...)
 	}
+
 	return records
 }
 
-func (s *exchangeServer) endpointRecordsFor(
+func (server *exchangeServer) endpointRecordsFor(
 	public *net.UDPAddr,
 	local *net.UDPAddr,
 	handle proto.Handle,
 ) []proto.PeerRecord {
-	if s.endpointRecords != nil {
-		return s.endpointRecords(public, local, handle)
+	if server.endpointRecords != nil {
+		return server.endpointRecords(public, local, handle)
 	}
+
 	return exchangeEndpointRecords(public, local, handle)
 }
 
@@ -134,58 +160,70 @@ func exchangeEndpointRecords(
 	local *net.UDPAddr,
 	handle proto.Handle,
 ) []proto.PeerRecord {
-	records := make([]proto.PeerRecord, 0, 2)
+	records := make([]proto.PeerRecord, 0, endpointRecordsPerPeer)
 	if record, ok := proto.PeerRecordFrom(public, handle); ok {
 		records = append(records, record)
 	}
+
 	if local != nil && !udpAddrEqual(local, public) {
 		if record, ok := proto.PeerRecordFrom(local, handle); ok {
 			records = append(records, record)
 		}
 	}
+
 	return records
 }
 
-func (s *exchangeServer) discoveryRecipients(channel string) []discoveryRecipient {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (server *exchangeServer) discoveryRecipients(
+	channel string,
+) []discoveryRecipient {
+	server.mu.Lock()
+	defer server.mu.Unlock()
 
-	entries := s.entries[channel]
+	entries := server.entries[channel]
 	recipients := make([]discoveryRecipient, 0, len(entries))
+
 	for _, item := range entries {
 		if item.session == nil || item.session.voice == nil {
 			continue
 		}
+
 		recipients = append(recipients, discoveryRecipient{
 			addr:    addrCopy(item.addr),
 			handle:  item.handle,
 			session: item.session.voice,
 		})
 	}
+
 	return recipients
 }
 
-func (s *exchangeServer) discoveryPacketSent(
+func (server *exchangeServer) discoveryPacketSent(
 	channel string,
 	recipient discoveryRecipient,
 	packet int,
 	packets int,
 	records []proto.PeerRecord,
 ) {
-	s.logger.Printf(
-		"SEND type=PEER_LIST channel=%q to_handle=%q to_addr=%s packet=%d/%d peers=[%s]",
-		channel, recipient.handle, recipient.addr,
-		packet, packets,
-		exchangeRecordsLog(records),
+	server.logger.Print("INFO ", karma.
+		Describe("type", "PEER_LIST").
+		Describe("channel", channel).
+		Describe("to_handle", recipient.handle).
+		Describe("to_addr", recipient.addr).
+		Describe("packet", packet).
+		Describe("packets", packets).
+		Describe("peers", exchangeRecordsLog(records)).
+		Format(nil, "packet sent"),
 	)
 }
 
 func exchangeRecordsLog(records []proto.PeerRecord) string {
 	peers := make([]string, len(records))
-	for i, record := range records {
-		peers[i] = fmt.Sprintf("%s@%s", record.Handle, record.Addr())
+	for index, record := range records {
+		peers[index] = fmt.Sprintf("%s@%s", record.Handle, record.Addr())
 	}
-	sort.Strings(peers)
+
+	slices.Sort(peers)
 
 	return strings.Join(peers, ",")
 }

@@ -1,78 +1,132 @@
 package main
 
 import (
+	"net"
 	"time"
 
+	"github.com/reconquest/karma-go"
+
+	sessioncrypto "chirik/internal/crypto"
 	"chirik/internal/proto"
 )
 
-func (s *exchangeServer) relayHandle(
+type relayRoute struct {
+	source  proto.Handle
+	target  proto.Handle
+	channel string
+	addr    *net.UDPAddr
+	voice   *sessioncrypto.Session
+}
+
+func (server *exchangeServer) relayHandle(
 	session *exchangeSession,
 	payload []byte,
 	now time.Time,
 ) {
-	targetHandle, inner, ok := proto.RelayParse(payload)
-	if !ok || !relayInnerValid(inner) {
+	targetHandle, inner, valid := proto.RelayParse(payload)
+	if !valid || !relayInnerValid(inner) {
 		return
 	}
 
-	s.mu.Lock()
-	if !s.sessionContains(session) || !session.registered || targetHandle == session.handle {
-		s.mu.Unlock()
+	route, valid := server.relayRouteFor(session, targetHandle, now)
+	if !valid {
 		return
 	}
-	target := s.entries[session.channel][targetHandle]
-	if target == nil || target.session == nil || target.session.voice == nil {
-		s.mu.Unlock()
-		return
-	}
-	var (
-		sourceHandle = session.handle
-		channel      = session.channel
-		targetAddr   = addrCopy(target.addr)
-		targetVoice  = target.session.voice
-	)
-	session.seen = now
-	s.mu.Unlock()
 
-	delivery, ok := proto.Relay(sourceHandle, inner)
-	if !ok {
+	delivery, valid := proto.Relay(route.source, inner)
+	if !valid {
 		return
 	}
-	packet, err := targetVoice.Seal(proto.Type_Relay, delivery)
-	if err != nil || datagramSend(s.conn, targetAddr, packet) != nil {
+
+	packet, err := route.voice.Seal(proto.Type_Relay, delivery)
+	if err != nil {
+		server.logger.Print("ERROR ", karma.
+			Describe("type", "RELAY").
+			Describe("to_addr", route.addr).
+			Format(err, "encrypt relay packet"),
+		)
+
+		return
+	}
+
+	err = datagramSend(server.conn, route.addr, packet)
+	if err != nil {
+		server.logger.Print("ERROR ", karma.
+			Describe("type", "RELAY").
+			Describe("to_addr", route.addr).
+			Format(err, "send relay packet"),
+		)
+
 		return
 	}
 
 	if relayInnerLoggable(inner) {
-		s.logger.Printf(
-			"SEND type=RELAY channel=%q from_handle=%q to_handle=%q to_addr=%s inner_bytes=%d",
-			channel, sourceHandle, targetHandle, targetAddr, len(inner),
+		server.logger.Print("INFO ", karma.
+			Describe("type", "RELAY").
+			Describe("channel", route.channel).
+			Describe("from_handle", route.source).
+			Describe("to_handle", route.target).
+			Describe("to_addr", route.addr).
+			Describe("inner_bytes", len(inner)).
+			Format(nil, "packet sent"),
 		)
 	}
 }
 
+func (server *exchangeServer) relayRouteFor(
+	session *exchangeSession,
+	targetHandle proto.Handle,
+	now time.Time,
+) (relayRoute, bool) {
+	server.mu.Lock()
+	defer server.mu.Unlock()
+
+	if !server.sessionContains(session) || !session.registered ||
+		targetHandle == session.handle {
+		return relayRoute{}, false
+	}
+
+	target := server.entries[session.channel][targetHandle]
+	if target == nil || target.session == nil || target.session.voice == nil {
+		return relayRoute{}, false
+	}
+
+	session.seen = now
+
+	return relayRoute{
+		source:  session.handle,
+		target:  targetHandle,
+		channel: session.channel,
+		addr:    addrCopy(target.addr),
+		voice:   target.session.voice,
+	}, true
+}
+
 func relayInnerValid(packet []byte) bool {
-	if _, ok := proto.KEXParse(packet); ok {
+	if _, valid := proto.KEXParse(packet); valid {
 		return true
 	}
 
-	kind, _, _, _, ok := proto.EnvelopeParse(packet)
-	if !ok {
+	kind, _, _, _, valid := proto.EnvelopeParse(packet)
+	if !valid {
 		return false
 	}
+
 	switch kind {
 	case proto.Type_Request, proto.Type_PeerListAudio, proto.Type_Audio:
 		return true
+
 	default:
 		return false
 	}
 }
 
 func relayInnerLoggable(packet []byte) bool {
-	if _, ok := proto.KEXParse(packet); ok {
+	if _, valid := proto.KEXParse(packet); valid {
 		return true
 	}
-	kind, _, _, _, ok := proto.EnvelopeParse(packet)
-	return ok && kind != proto.Type_Audio
+
+	kind, _, _, _, valid := proto.EnvelopeParse(packet)
+
+	return valid && kind != proto.Type_Audio
 }

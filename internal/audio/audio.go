@@ -4,10 +4,11 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"io"
 	"sync"
 	"time"
+
+	"github.com/reconquest/karma-go"
 
 	"chirik/internal/proto"
 	"chirik/internal/pulse"
@@ -15,6 +16,8 @@ import (
 )
 
 const (
+	pcmSampleBytes = 2
+
 	bufferChunks        = 32
 	playbackFadeSamples = 120
 )
@@ -22,10 +25,10 @@ const (
 type Device struct {
 	Capture io.Reader
 
-	client  *pulse.Client
-	capture *pcmBuffer
-	record  *pulse.RecordStream
-	sink    *pulse.Sink
+	client        *pulse.Client
+	captureBuffer *pcmBuffer
+	record        *pulse.RecordStream
+	sink          *pulse.Sink
 
 	mu        sync.Mutex
 	playbacks map[*Playback]struct{}
@@ -66,11 +69,12 @@ func Check(sourceID, sinkID string) error {
 		pulse.ClientTimeout(time.Second),
 	)
 	if err != nil {
-		return fmt.Errorf("connect to PipeWire Pulse server: %w", err)
+		return karma.Format(err, "connect to PipeWire Pulse server")
 	}
 	defer client.Close()
 
 	_, _, err = devicesResolve(client, sourceID, sinkID)
+
 	return err
 }
 
@@ -80,12 +84,13 @@ func Open(sourceID, sinkID string) (*Device, error) {
 		pulse.ClientTimeout(time.Second),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("connect to PipeWire Pulse server: %w", err)
+		return nil, karma.Format(err, "connect to PipeWire Pulse server")
 	}
 
 	source, sink, err := devicesResolve(client, sourceID, sinkID)
 	if err != nil {
 		client.Close()
+
 		return nil, err
 	}
 
@@ -93,9 +98,10 @@ func Open(sourceID, sinkID string) (*Device, error) {
 	recordOptions := []pulse.RecordOption{
 		pulse.RecordSampleRate(proto.SampleRate),
 		pulse.RecordChannels(pulseproto.ChannelMap{pulseproto.ChannelMono}),
-		pulse.RecordBufferFragmentSize(proto.FrameSamples * 2),
+		pulse.RecordBufferFragmentSize(proto.FrameSamples * pcmSampleBytes),
 		pulse.RecordMediaName("chirik capture"),
 	}
+
 	if source != nil {
 		recordOptions = append(recordOptions, pulse.RecordSource(source))
 	}
@@ -107,21 +113,23 @@ func Open(sourceID, sinkID string) (*Device, error) {
 	if err != nil {
 		client.Close()
 		captureBuffer.Close()
-		return nil, fmt.Errorf("create capture stream: %w", err)
+
+		return nil, karma.Format(err, "create capture stream")
 	}
+
 	record.Start()
 
 	return &Device{
-		Capture:   captureBuffer,
-		client:    client,
-		capture:   captureBuffer,
-		record:    record,
-		sink:      sink,
-		playbacks: make(map[*Playback]struct{}),
+		Capture:       captureBuffer,
+		client:        client,
+		captureBuffer: captureBuffer,
+		record:        record,
+		sink:          sink,
+		playbacks:     make(map[*Playback]struct{}),
 	}, nil
 }
 
-func (d *Device) PlaybackOpen(mediaName string) (*Playback, error) {
+func (device *Device) PlaybackOpen(mediaName string) (*Playback, error) {
 	buffer := pcmBufferNew(true)
 	options := []pulse.PlaybackOption{
 		pulse.PlaybackSampleRate(proto.SampleRate),
@@ -129,81 +137,96 @@ func (d *Device) PlaybackOpen(mediaName string) (*Playback, error) {
 		pulse.PlaybackBufferSize(proto.FrameSamples),
 		pulse.PlaybackMediaName(mediaName),
 	}
-	if d.sink != nil {
-		options = append(options, pulse.PlaybackSink(d.sink))
+
+	if device.sink != nil {
+		options = append(options, pulse.PlaybackSink(device.sink))
 	}
 
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if d.closed {
+	device.mu.Lock()
+	defer device.mu.Unlock()
+
+	if device.closed {
 		buffer.Close()
+
 		return nil, errors.New("audio device closed")
 	}
 
-	stream, err := d.client.NewPlayback(
+	stream, err := device.client.NewPlayback(
 		pulse.NewReader(buffer, pulseproto.FormatInt16LE),
 		options...,
 	)
 	if err != nil {
 		buffer.Close()
-		return nil, fmt.Errorf("create playback stream: %w", err)
+
+		return nil, karma.Format(err, "create playback stream")
 	}
+
 	stream.Start()
 
 	playback := &Playback{
-		device: d,
+		device: device,
 		buffer: buffer,
 		stream: stream,
 	}
-	d.playbacks[playback] = struct{}{}
+
+	device.playbacks[playback] = struct{}{}
 
 	return playback, nil
 }
 
-func (d *Device) Wait(ctx context.Context) error {
+func (device *Device) Wait(ctx context.Context) error {
 	select {
 	case <-ctx.Done():
 		return nil
 
-	case <-d.client.Done():
-		if err := d.client.Error(); err != nil {
-			return err
+	case <-device.client.Done():
+		err := device.client.Error()
+		if err != nil {
+			return karma.Format(err, "read audio connection")
 		}
 
 		return errors.New("audio connection closed")
 	}
 }
 
-func (d *Device) Close() {
-	d.close.Do(func() {
-		d.mu.Lock()
-		d.closed = true
-		playbacks := make([]*Playback, 0, len(d.playbacks))
-		for playback := range d.playbacks {
+func (device *Device) Close() {
+	device.close.Do(func() {
+		device.mu.Lock()
+
+		device.closed = true
+
+		playbacks := make([]*Playback, 0, len(device.playbacks))
+
+		for playback := range device.playbacks {
 			playbacks = append(playbacks, playback)
 		}
-		d.mu.Unlock()
+
+		device.mu.Unlock()
 
 		for _, playback := range playbacks {
 			playback.Close()
 		}
 
-		d.record.Close()
-		d.capture.Close()
-		d.client.Close()
+		device.record.Close()
+		device.captureBuffer.Close()
+		device.client.Close()
 	})
 }
 
-func (p *Playback) Write(data []byte) (int, error) { return p.buffer.Write(data) }
+func (playback *Playback) Write(
+	data []byte,
+) (int, error) {
+	return playback.buffer.Write(data)
+}
 
-func (p *Playback) Close() {
-	p.close.Do(func() {
-		p.stream.Close()
-		p.buffer.Close()
+func (playback *Playback) Close() {
+	playback.close.Do(func() {
+		playback.stream.Close()
+		playback.buffer.Close()
 
-		p.device.mu.Lock()
-		delete(p.device.playbacks, p)
-		p.device.mu.Unlock()
+		playback.device.mu.Lock()
+		delete(playback.device.playbacks, playback)
+		playback.device.mu.Unlock()
 	})
 }
 
@@ -221,14 +244,16 @@ func devicesResolve(
 	if sourceID != "" {
 		source, err = client.SourceByID(sourceID)
 		if err != nil {
-			return nil, nil, fmt.Errorf("find source %q: %w", sourceID, err)
+			return nil, nil, karma.Describe("source_id", sourceID).
+				Format(err, "find source")
 		}
 	}
 
 	if sinkID != "" {
 		sink, err = client.SinkByID(sinkID)
 		if err != nil {
-			return nil, nil, fmt.Errorf("find sink %q: %w", sinkID, err)
+			return nil, nil, karma.Describe("sink_id", sinkID).
+				Format(err, "find sink")
 		}
 	}
 
@@ -243,82 +268,93 @@ func pcmBufferNew(silence bool) *pcmBuffer {
 	}
 }
 
-func (b *pcmBuffer) Read(data []byte) (int, error) {
-	if b.silence {
-		return b.readPlayback(data)
+func (buffer *pcmBuffer) Read(data []byte) (int, error) {
+	if buffer.silence {
+		return buffer.readPlayback(data)
 	}
 
-	return b.readCapture(data)
+	return buffer.readCapture(data)
 }
 
-func (b *pcmBuffer) Write(data []byte) (int, error) {
+func (buffer *pcmBuffer) Write(data []byte) (int, error) {
 	select {
-	case <-b.done:
+	case <-buffer.done:
 		return 0, errors.New("audio buffer closed")
+
 	default:
 	}
 
 	chunk := append([]byte(nil), data...)
 	select {
-	case b.chunks <- chunk:
+	case buffer.chunks <- chunk:
 		return len(data), nil
+
 	default:
 	}
 
 	select {
-	case <-b.chunks:
+	case <-buffer.chunks:
 	default:
 	}
 
 	select {
-	case b.chunks <- chunk:
+	case buffer.chunks <- chunk:
 		return len(data), nil
-	case <-b.done:
+
+	case <-buffer.done:
 		return 0, errors.New("audio buffer closed")
 	}
 }
 
-func (b *pcmBuffer) Close() {
-	b.close.Do(func() { close(b.done) })
+func (buffer *pcmBuffer) Close() {
+	buffer.close.Do(func() { close(buffer.done) })
 }
 
-func (b *pcmBuffer) readCapture(data []byte) (int, error) {
-	for len(b.pending) == 0 {
+func (buffer *pcmBuffer) readCapture(data []byte) (int, error) {
+	for len(buffer.pending) == 0 {
 		select {
-		case b.pending = <-b.chunks:
-		case <-b.done:
+		case buffer.pending = <-buffer.chunks:
+		case <-buffer.done:
 			return 0, io.EOF
 		}
 	}
 
-	n := copy(data, b.pending)
-	b.pending = b.pending[n:]
+	n := copy(data, buffer.pending)
+
+	buffer.pending = buffer.pending[n:]
+
 	return n, nil
 }
 
-func (b *pcmBuffer) readPlayback(data []byte) (int, error) {
+func (buffer *pcmBuffer) readPlayback(data []byte) (int, error) {
 	clear(data)
+
 	written := 0
 	for written < len(data) {
-		if len(b.pending) != 0 {
+		if len(buffer.pending) != 0 {
 			start := written
-			n := copy(data[written:], b.pending)
-			b.pending = b.pending[n:]
+			n := copy(data[written:], buffer.pending)
+
+			buffer.pending = buffer.pending[n:]
+
 			written += n
-			b.playbackSamplesApply(data[start:written])
+			buffer.playbackSamplesApply(data[start:written])
+
 			continue
 		}
 
 		select {
-		case b.pending = <-b.chunks:
-		case <-b.done:
+		case buffer.pending = <-buffer.chunks:
+		case <-buffer.done:
 			if written == 0 {
 				return 0, io.EOF
 			}
 
 			return written, nil
+
 		default:
-			b.playbackSilenceFill(data[written:])
+			buffer.playbackSilenceFill(data[written:])
+
 			return len(data), nil
 		}
 	}
@@ -326,50 +362,68 @@ func (b *pcmBuffer) readPlayback(data []byte) (int, error) {
 	return written, nil
 }
 
-func (b *pcmBuffer) playbackSamplesApply(data []byte) {
-	if b.playbackUnderflow {
-		b.playbackRecoverStart = b.playbackLast
-		b.playbackRecoverPos = 0
-		b.playbackUnderflow = false
+func (buffer *pcmBuffer) playbackSamplesApply(data []byte) {
+	if buffer.playbackUnderflow {
+		buffer.playbackRecoverStart = buffer.playbackLast
+		buffer.playbackRecoverPos = 0
+		buffer.playbackUnderflow = false
 	}
 
-	for i := range len(data) / 2 {
-		sample := int16(binary.LittleEndian.Uint16(data[2*i:]))
-		if b.playbackRecoverPos < playbackFadeSamples {
-			progress := b.playbackRecoverPos + 1
-			sample = int16(
-				(int32(b.playbackRecoverStart)*int32(playbackFadeSamples-progress) +
-					int32(sample)*int32(progress)) /
-					playbackFadeSamples,
-			)
-			b.playbackRecoverPos++
+	for sampleIndex := range len(data) / pcmSampleBytes {
+		sample := int16(
+			binary.LittleEndian.Uint16(data[pcmSampleBytes*sampleIndex:]),
+		)
+
+		if buffer.playbackRecoverPos < playbackFadeSamples {
+			progress := buffer.playbackRecoverPos + 1
+
+			previous := int32(buffer.playbackRecoverStart) *
+				int32(playbackFadeSamples-progress)
+			current := int32(sample) * int32(progress)
+
+			sample = int16((previous + current) / playbackFadeSamples)
+			buffer.playbackRecoverPos++
 		}
 
-		binary.LittleEndian.PutUint16(data[2*i:], uint16(sample))
-		b.playbackLast = sample
+		binary.LittleEndian.PutUint16(
+			data[pcmSampleBytes*sampleIndex:],
+			uint16(sample),
+		)
+
+		buffer.playbackLast = sample
 	}
 }
 
-func (b *pcmBuffer) playbackSilenceFill(data []byte) {
+func (buffer *pcmBuffer) playbackSilenceFill(data []byte) {
 	clear(data)
-	if !b.playbackUnderflow {
-		b.playbackUnderflow = true
-		b.playbackFadeStart = b.playbackLast
-		b.playbackFadePosition = 0
+
+	if !buffer.playbackUnderflow {
+		buffer.playbackUnderflow = true
+		buffer.playbackFadeStart = buffer.playbackLast
+		buffer.playbackFadePosition = 0
 	}
 
-	for i := range len(data) / 2 {
-		if b.playbackFadePosition >= playbackFadeSamples {
-			b.playbackLast = 0
+	for sampleIndex := range len(data) / pcmSampleBytes {
+		if buffer.playbackFadePosition >= playbackFadeSamples {
+			buffer.playbackLast = 0
+
 			continue
 		}
 
-		remaining := playbackFadeSamples - b.playbackFadePosition - 1
+		remaining := playbackFadeSamples - buffer.playbackFadePosition - 1
 		sample := int16(
-			int32(b.playbackFadeStart) * int32(remaining) / playbackFadeSamples,
+			int32(
+				buffer.playbackFadeStart,
+			) * int32(
+				remaining,
+			) / playbackFadeSamples,
 		)
-		binary.LittleEndian.PutUint16(data[2*i:], uint16(sample))
-		b.playbackLast = sample
-		b.playbackFadePosition++
+		binary.LittleEndian.PutUint16(
+			data[pcmSampleBytes*sampleIndex:],
+			uint16(sample),
+		)
+
+		buffer.playbackLast = sample
+		buffer.playbackFadePosition++
 	}
 }

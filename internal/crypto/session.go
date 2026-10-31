@@ -13,10 +13,14 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/reconquest/karma-go"
+
 	"chirik/internal/proto"
 )
 
 const PublicKeyBytes = proto.PublicKeyBytes
+
+const sessionKeyMaterialBytes = 64
 
 const infoLabel = "CHIRIK-V2-AES-256-GCM"
 
@@ -51,15 +55,15 @@ type Session struct {
 func KeyPairGenerate() (*KeyPair, error) {
 	private, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
-		return nil, err
+		return nil, karma.Format(err, "generate X25519 key pair")
 	}
 
 	return keyPairNew(private), nil
 }
 
-func (p *KeyPair) Public() [PublicKeyBytes]byte { return p.public }
+func (pair *KeyPair) Public() [PublicKeyBytes]byte { return pair.public }
 
-func (p *KeyPair) Derive(peerBytes []byte, salt []byte) (Keys, error) {
+func (pair *KeyPair) Derive(peerBytes, salt []byte) (Keys, error) {
 	var keys Keys
 
 	if len(peerBytes) != PublicKeyBytes {
@@ -68,32 +72,40 @@ func (p *KeyPair) Derive(peerBytes []byte, salt []byte) (Keys, error) {
 
 	peer, err := ecdh.X25519().NewPublicKey(peerBytes)
 	if err != nil {
-		return keys, fmt.Errorf("peer public key: %w", err)
+		return keys, karma.Format(err, "parse peer public key")
 	}
 
-	shared, err := p.private.ECDH(peer)
+	shared, err := pair.private.ECDH(peer)
 	if err != nil {
-		return keys, fmt.Errorf("ECDH: %w", err)
+		return keys, karma.Format(err, "derive ECDH shared secret")
 	}
 
-	order := bytes.Compare(p.public[:], peerBytes)
+	order := bytes.Compare(pair.public[:], peerBytes)
 	if order == 0 {
 		return keys, ErrPublicKeys
 	}
 
 	info := make([]byte, 0, len(infoLabel)+2*PublicKeyBytes)
+
 	info = append(info, infoLabel...)
+
 	if order < 0 {
-		info = append(info, p.public[:]...)
+		info = append(info, pair.public[:]...)
 		info = append(info, peerBytes...)
 	} else {
 		info = append(info, peerBytes...)
-		info = append(info, p.public[:]...)
+		info = append(info, pair.public[:]...)
 	}
 
-	material, err := hkdf.Key(sha256.New, shared, salt, string(info), 64)
+	material, err := hkdf.Key(
+		sha256.New,
+		shared,
+		salt,
+		string(info),
+		sessionKeyMaterialBytes,
+	)
 	if err != nil {
-		return Keys{}, fmt.Errorf("derive session keys: %w", err)
+		return Keys{}, karma.Format(err, "derive session keys")
 	}
 
 	if order < 0 {
@@ -110,18 +122,18 @@ func (p *KeyPair) Derive(peerBytes []byte, salt []byte) (Keys, error) {
 func SessionNew(keys Keys) (*Session, error) {
 	send, err := aeadNew(keys.Send[:])
 	if err != nil {
-		return nil, fmt.Errorf("send AEAD: %w", err)
+		return nil, karma.Format(err, "create send AEAD")
 	}
 
 	recv, err := aeadNew(keys.Receive[:])
 	if err != nil {
-		return nil, fmt.Errorf("receive AEAD: %w", err)
+		return nil, karma.Format(err, "create receive AEAD")
 	}
 
 	return &Session{send: send, recv: recv}, nil
 }
 
-func (s *Session) Seal(kind byte, payload []byte) ([]byte, error) {
+func (session *Session) Seal(kind byte, payload []byte) ([]byte, error) {
 	if !proto.TypeEncrypted(kind) {
 		return nil, ErrUnknown
 	}
@@ -130,48 +142,57 @@ func (s *Session) Seal(kind byte, payload []byte) ([]byte, error) {
 		return nil, ErrPayload
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	session.mu.Lock()
+	defer session.mu.Unlock()
 
-	seq := s.sendSeq[kind] + 1
+	seq := session.sendSeq[kind] + 1
 	if seq == 0 {
 		return nil, ErrSequence
 	}
-	s.sendSeq[kind] = seq
+
+	session.sendSeq[kind] = seq
 
 	header := proto.EnvelopeHeaderFor(kind, seq)
 	nonce := nonceFor(kind, seq)
-	packet := make([]byte, proto.EnvelopeHeader, proto.EnvelopeHeader+len(payload)+proto.TagBytes)
+	packet := make(
+		[]byte,
+		proto.EnvelopeHeader,
+		proto.EnvelopeHeader+len(payload)+proto.TagBytes,
+	)
 	copy(packet, header[:])
-	packet = s.send.Seal(packet, nonce[:], payload, header[:])
+
+	packet = session.send.Seal(packet, nonce[:], payload, header[:])
 
 	return packet, nil
 }
 
-func (s *Session) Open(packet []byte) (kind byte, seq uint64, payload []byte, err error) {
+func (session *Session) Open(
+	packet []byte,
+) (byte, uint64, []byte, error) {
 	kind, seq, aad, ciphertext, ok := proto.EnvelopeParse(packet)
 	if !ok {
 		return 0, 0, nil, ErrPacket
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	session.mu.Lock()
+	defer session.mu.Unlock()
 
-	if seq <= s.recvLast[kind] {
+	if seq <= session.recvLast[kind] {
 		return kind, seq, nil, ErrReplay
 	}
 
 	nonce := nonceFor(kind, seq)
-	payload, err = s.recv.Open(nil, nonce[:], ciphertext, aad)
+
+	payload, err := session.recv.Open(nil, nonce[:], ciphertext, aad)
 	if err != nil {
-		return kind, seq, nil, err
+		return kind, seq, nil, karma.Format(err, "decrypt session packet")
 	}
 
 	if len(payload) > proto.MaxPayload {
 		return kind, seq, nil, ErrPayload
 	}
 
-	s.recvLast[kind] = seq
+	session.recvLast[kind] = seq
 
 	return kind, seq, payload, nil
 }
@@ -186,10 +207,15 @@ func keyPairNew(private *ecdh.PrivateKey) *KeyPair {
 func aeadNew(key []byte) (cipher.AEAD, error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
-		return nil, err
+		return nil, karma.Format(err, "create AES cipher")
 	}
 
-	return cipher.NewGCM(block)
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, karma.Format(err, "create GCM")
+	}
+
+	return aead, nil
 }
 
 func nonceFor(kind byte, seq uint64) [12]byte {

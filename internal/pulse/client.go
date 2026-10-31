@@ -8,6 +8,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/reconquest/karma-go"
+
 	"chirik/internal/pulse/proto"
 )
 
@@ -107,7 +109,7 @@ func NewClient(opts ...ClientOption) (*Client, error) {
 		case *proto.ConnectionClosed:
 			connectionErr := error(ErrConnectionClosed)
 			if msg.Err != nil {
-				connectionErr = fmt.Errorf("%w: %v", ErrConnectionClosed, msg.Err)
+				connectionErr = karma.Format(ErrConnectionClosed, "%v", msg.Err)
 			}
 
 			c.mu.Lock()

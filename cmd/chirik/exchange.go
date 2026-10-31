@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
-	"fmt"
 	"io"
 	"log"
 	"net"
@@ -14,28 +13,33 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/reconquest/karma-go"
+
 	sessioncrypto "chirik/internal/crypto"
 	"chirik/internal/proto"
 )
 
-type exchangeEntry struct {
-	addr    *net.UDPAddr
-	local   *net.UDPAddr
-	handle  proto.Handle
-	channel string
-	session *exchangeSession
-	seen    time.Time
-}
+const exchangeUsageText = `Run peer discovery and relay fallback.
 
-type exchangeSession struct {
-	addr       *net.UDPAddr
-	peerPublic [sessioncrypto.PublicKeyBytes]byte
-	voice      *sessioncrypto.Session
-	seen       time.Time
-	registered bool
-	handle     proto.Handle
-	channel    string
-}
+Usage:
+  chirik exchange <listen-address>
+  chirik exchange -h | --help
+
+Arguments:
+  listen-address  IPv4 host and non-zero UDP port to listen on.
+                  Use 0:<port> to listen on all IPv4 interfaces.
+
+Options:
+  -h, --help  Show this help.
+
+Operation:
+  The exchange generates an ephemeral X25519 key pair at startup and logs
+  its public key. Restarting the exchange generates a different key pair.
+  Ctrl-C and SIGTERM stop the exchange.
+
+Example:
+  chirik exchange 0:7777
+`
 
 type exchangeServer struct {
 	conn            *net.UDPConn
@@ -44,365 +48,198 @@ type exchangeServer struct {
 	entries         map[string]map[proto.Handle]*exchangeEntry
 	sessions        map[string][]*exchangeSession
 	discovery       *discoveryEngine
-	endpointRecords func(*net.UDPAddr, *net.UDPAddr, proto.Handle) []proto.PeerRecord
-	mu              sync.Mutex
+	endpointRecords func(
+		*net.UDPAddr,
+		*net.UDPAddr,
+		proto.Handle,
+	) []proto.PeerRecord
+	mu sync.Mutex
 }
 
-func exchangeRun(args []string, stderr io.Writer) int {
-	if len(args) != 1 {
-		fmt.Fprintln(stderr, "usage: chirik exchange <host>:<port>")
-		return 2
+func exchangeRun(args []string, stderr io.Writer, outputs ...io.Writer) int {
+	stdout := io.Writer(os.Stdout)
+	if len(outputs) > 0 {
+		stdout = outputs[0]
 	}
 
-	addr, err := exchangeAddrResolve(args[0])
+	arguments, code := argumentsParse(exchangeUsageText,
+		append([]string{"exchange"}, args...), stdout, stderr)
+	if arguments == nil {
+		return code
+	}
+
+	logger := loggerNew(stderr)
+
+	addr, err := exchangeAddrResolve(arguments.ValueListen)
 	if err != nil {
-		fmt.Fprintf(stderr, "exchange address: %v\n", err)
-		return 1
-	}
-	if addr.Port == 0 {
-		fmt.Fprintln(stderr, "exchange address: port must be non-zero")
+		logger.Print("ERROR ", karma.
+			Describe("address", arguments.ValueListen).
+			Format(err, "exchange address resolution"),
+		)
+
 		return 1
 	}
 
+	if addr.Port == 0 {
+		logger.Print("ERROR exchange address rejected: port must be non-zero")
+
+		return 1
+	}
+
+	server, err := exchangeServerStart(addr, logger)
+	if err != nil {
+		logger.Print("ERROR ", karma.
+			Describe("address", addr).
+			Format(err, "exchange startup"),
+		)
+
+		return 1
+	}
+	defer exchangeListenerClose(server, logger)
+
+	ctx, stop := signal.NotifyContext(
+		context.Background(),
+		os.Interrupt,
+		syscall.SIGTERM,
+	)
+	defer stop()
+
+	err = server.run(ctx)
+
+	stop()
+
+	if err != nil {
+		logger.Print("ERROR ", karma.Format(err, "exchange"))
+
+		return 1
+	}
+
+	logger.Print("INFO exchange stopped")
+
+	return 0
+}
+
+func exchangeServerStart(
+	addr *net.UDPAddr,
+	logger *log.Logger,
+) (*exchangeServer, error) {
 	pair, err := sessioncrypto.KeyPairGenerate()
 	if err != nil {
-		fmt.Fprintf(stderr, "exchange key: %v\n", err)
-		return 1
+		return nil, karma.Format(err, "generate exchange key pair")
 	}
 
 	conn, err := net.ListenUDP("udp4", addr)
 	if err != nil {
-		fmt.Fprintf(stderr, "exchange listen: %v\n", err)
-		return 1
+		return nil, karma.Format(err, "listen for exchange datagrams")
 	}
-	defer conn.Close()
 
-	s := &exchangeServer{
+	server := &exchangeServer{
 		conn:     conn,
-		logger:   log.New(stderr, "", log.LstdFlags),
+		logger:   logger,
 		pair:     pair,
 		entries:  make(map[string]map[proto.Handle]*exchangeEntry),
 		sessions: make(map[string][]*exchangeSession),
 	}
-	s.discoveryEnsure()
+	server.discoveryEnsure()
+
 	public := pair.Public()
-	fmt.Fprintf(stderr, "exchange public key: %s\n", base64.StdEncoding.EncodeToString(public[:]))
+	logger.Print("INFO ", karma.
+		Describe("address", conn.LocalAddr()).
+		Describe("public_key", base64.StdEncoding.EncodeToString(public[:])).
+		Format(nil, "exchange started"),
+	)
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	stopped := make(chan struct{})
+	return server, nil
+}
+
+func exchangeListenerClose(server *exchangeServer, logger *log.Logger) {
+	err := server.conn.Close()
+	if err != nil && !errors.Is(err, net.ErrClosed) {
+		logger.Print("ERROR ", karma.Format(err, "exchange listener shutdown"))
+	}
+}
+
+func (server *exchangeServer) run(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	closeConn := context.AfterFunc(ctx, func() { _ = server.conn.Close() })
+
+	defer closeConn()
+
+	var workers sync.WaitGroup
+
+	workers.Add(1)
+
 	go func() {
-		select {
-		case <-ctx.Done():
-			conn.Close()
-		case <-stopped:
-		}
-	}()
-	go s.sweepLoop(stopped)
+		defer workers.Done()
 
-	err = s.serve()
-	close(stopped)
-	if err != nil {
-		fmt.Fprintf(stderr, "exchange: %v\n", err)
-		return 1
+		server.sweepLoop(ctx.Done())
+	}()
+
+	err := server.serve()
+
+	cancel()
+
+	closeErr := server.conn.Close()
+
+	workers.Wait()
+
+	if err == nil && closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+		return karma.Format(closeErr, "close exchange listener")
 	}
 
-	return 0
+	return err
 }
 
 func exchangeAddrResolve(raw string) (*net.UDPAddr, error) {
 	host, port, err := net.SplitHostPort(raw)
 	if err != nil {
-		return nil, err
+		return nil, karma.Format(err, "split exchange address")
 	}
+
 	if host == "0" {
 		raw = net.JoinHostPort("0.0.0.0", port)
 	}
 
-	return net.ResolveUDPAddr("udp4", raw)
+	addr, err := net.ResolveUDPAddr("udp4", raw)
+	if err != nil {
+		return nil, karma.Format(err, "resolve exchange address")
+	}
+
+	return addr, nil
 }
 
-func (s *exchangeServer) serve() error {
+func (server *exchangeServer) serve() error {
 	buffer := make([]byte, proto.MaxDatagram+1)
 	for {
-		n, addr, err := s.conn.ReadFromUDP(buffer)
+		readCount, addr, err := server.conn.ReadFromUDP(buffer)
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				return nil
 			}
 
-			return err
+			return karma.Format(err, "read exchange datagram")
 		}
 
-		if n > proto.MaxDatagram {
+		if readCount > proto.MaxDatagram {
 			continue
 		}
 
-		s.handle(buffer[:n], addr, time.Now())
+		server.handle(buffer[:readCount], addr, time.Now())
 	}
 }
 
-func (s *exchangeServer) handle(packet []byte, addr *net.UDPAddr, now time.Time) {
+func (server *exchangeServer) handle(
+	packet []byte,
+	addr *net.UDPAddr,
+	now time.Time,
+) {
 	if public, ok := proto.KEXParse(packet); ok {
-		s.kexHandle(addr, public, now)
+		server.kexHandle(addr, public, now)
+
 		return
 	}
 
-	s.encryptedHandle(addr, packet, now)
-}
-
-func (s *exchangeServer) kexHandle(
-	addr *net.UDPAddr,
-	peerPublic [sessioncrypto.PublicKeyBytes]byte,
-	now time.Time,
-) {
-	key := addr.String()
-	s.mu.Lock()
-	for _, stored := range s.sessions[key] {
-		if stored.peerPublic == peerPublic {
-			s.mu.Unlock()
-			if discoveryKEXSend(s.conn, addr, s.pair) {
-				s.logger.Printf("SEND type=KEX to_addr=%s", addr)
-			}
-			return
-		}
-	}
-	s.mu.Unlock()
-
-	zero := [32]byte{}
-	voice, err := discoverySessionNew(s.pair, peerPublic, zero[:])
-	if err != nil {
-		return
-	}
-
-	session := &exchangeSession{
-		addr:       addrCopy(addr),
-		peerPublic: peerPublic,
-		voice:      voice,
-		seen:       now,
-	}
-	s.mu.Lock()
-	s.sessions[key] = append(s.sessions[key], session)
-	s.mu.Unlock()
-
-	if discoveryKEXSend(s.conn, addr, s.pair) {
-		s.logger.Printf("SEND type=KEX to_addr=%s", addr)
-	}
-}
-
-func (s *exchangeServer) encryptedHandle(addr *net.UDPAddr, packet []byte, now time.Time) {
-	s.mu.Lock()
-	sessions := append([]*exchangeSession(nil), s.sessions[addr.String()]...)
-	s.mu.Unlock()
-
-	for _, session := range sessions {
-		kind, _, payload, err := session.voice.Open(packet)
-		if err != nil {
-			continue
-		}
-
-		switch kind {
-		case proto.Type_Request:
-			handle, channel, local, ok := s.discoveryEnsure().request(payload)
-			if !ok {
-				return
-			}
-			if _, ok := proto.PeerRecordFrom(addr, handle); !ok {
-				return
-			}
-			s.registrationHandle(session, addr, local, handle, channel, now)
-
-		case proto.Type_PeerListAudio:
-			s.peerListHandle(session, payload, now)
-
-		case proto.Type_Relay:
-			s.relayHandle(session, payload, now)
-		}
-		return
-	}
-}
-
-func (s *exchangeServer) registrationHandle(
-	session *exchangeSession,
-	addr *net.UDPAddr,
-	local *net.UDPAddr,
-	handle proto.Handle,
-	channel string,
-	now time.Time,
-) {
-	s.mu.Lock()
-	if !s.sessionContains(session) {
-		s.mu.Unlock()
-		return
-	}
-
-	if session.registered && (session.handle != handle || session.channel != channel) {
-		oldEntries := s.entries[session.channel]
-		if item := oldEntries[session.handle]; item != nil && item.session == session {
-			delete(oldEntries, session.handle)
-		}
-		if len(oldEntries) == 0 {
-			delete(s.entries, session.channel)
-		}
-	}
-
-	channelEntries := s.entries[channel]
-	if channelEntries == nil {
-		channelEntries = make(map[proto.Handle]*exchangeEntry)
-		s.entries[channel] = channelEntries
-	}
-
-	var (
-		previous = channelEntries[handle]
-		changed  = previous == nil || previous.session != session ||
-			!udpAddrEqual(previous.addr, addr) || !udpAddrEqual(previous.local, local)
-	)
-	if previous != nil && previous.session != session {
-		if previous.session != nil {
-			s.sessionRemove(previous.session)
-		} else {
-			delete(channelEntries, handle)
-		}
-		s.entries[channel] = channelEntries
-	}
-
-	channelEntries[handle] = &exchangeEntry{
-		addr:    addrCopy(addr),
-		local:   addrCopy(local),
-		handle:  handle,
-		channel: channel,
-		session: session,
-		seen:    now,
-	}
-	session.registered = true
-	session.handle = handle
-	session.channel = channel
-	session.seen = now
-
-	s.mu.Unlock()
-
-	s.logger.Printf(
-		"CONNECT channel=%q handle=%q addr=%s peers=[%s]",
-		channel, handle, addr,
-		exchangeRecordsLog(s.discoveryRecords(channel, "")),
-	)
-
-	discovery := s.discoveryEnsure()
-	recipient := discoveryRecipient{
-		addr:    addrCopy(addr),
-		handle:  handle,
-		session: session.voice,
-	}
-	discovery.sendRecords(channel, recipient, nil)
-	if changed {
-		discovery.broadcastRecordsExcept(
-			channel,
-			recipient,
-			s.endpointRecordsFor(addr, local, handle),
-		)
-	}
-}
-
-func (s *exchangeServer) sessionContains(session *exchangeSession) bool {
-	for _, stored := range s.sessions[session.addr.String()] {
-		if stored == session {
-			return true
-		}
-	}
-
-	return false
-}
-
-func (s *exchangeServer) sessionRemove(session *exchangeSession) {
-	key := session.addr.String()
-	stored := s.sessions[key]
-	for i, candidate := range stored {
-		if candidate != session {
-			continue
-		}
-
-		stored = append(stored[:i], stored[i+1:]...)
-		break
-	}
-
-	if len(stored) == 0 {
-		delete(s.sessions, key)
-	} else {
-		s.sessions[key] = stored
-	}
-
-	if !session.registered {
-		return
-	}
-
-	entries := s.entries[session.channel]
-	if item := entries[session.handle]; item != nil && item.session == session {
-		delete(entries, session.handle)
-	}
-	if len(entries) == 0 {
-		delete(s.entries, session.channel)
-	}
-}
-
-func (s *exchangeServer) sweepLoop(stopped <-chan struct{}) {
-	ticker := time.NewTicker(time.Minute)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case now := <-ticker.C:
-			s.mu.Lock()
-			s.entriesSweep(now)
-			s.sessionsSweep(now)
-			s.mu.Unlock()
-
-		case <-stopped:
-			return
-		}
-	}
-}
-
-func (s *exchangeServer) entriesSweep(now time.Time) {
-	var expired []*exchangeSession
-	for channel, entries := range s.entries {
-		for handle, item := range entries {
-			if now.Sub(item.seen) <= s.discoveryEnsure().policy.ttl {
-				continue
-			}
-
-			if item.session == nil {
-				delete(entries, handle)
-				continue
-			}
-
-			expired = append(expired, item.session)
-		}
-
-		if len(entries) == 0 {
-			delete(s.entries, channel)
-		}
-	}
-
-	for _, session := range expired {
-		s.sessionRemove(session)
-	}
-}
-
-func (s *exchangeServer) sessionsSweep(now time.Time) {
-	var expired []*exchangeSession
-	for _, sessions := range s.sessions {
-		for _, session := range sessions {
-			ttl := proto.KEXTimeout
-			if session.registered {
-				ttl = s.discoveryEnsure().policy.ttl
-			}
-			if now.Sub(session.seen) > ttl {
-				expired = append(expired, session)
-			}
-		}
-	}
-
-	for _, session := range expired {
-		s.sessionRemove(session)
-	}
+	server.encryptedHandle(addr, packet, now)
 }
