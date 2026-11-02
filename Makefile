@@ -1,7 +1,7 @@
 GO ?= go
 GOLANGCI_LINT ?= golangci-lint
 
-.PHONY: all chirik test lint clean
+.PHONY: all chirik test test-audio lint clean
 
 all: chirik
 
@@ -10,6 +10,9 @@ chirik:
 
 test:
 	$(GO) test ./...
+
+test-audio:
+	CHIRIK_AUDIO_TEST_DIR="$(CURDIR)/_tmp/audio-quality" $(GO) test -count=1 -v ./cmd/chirik -run '^TestAudioQuality$$'
 
 lint:
 	$(GO) vet ./...
