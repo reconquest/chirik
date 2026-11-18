@@ -81,7 +81,10 @@ func NewClient(opts ...ClientOption) (*Client, error) {
 			stream, ok := c.playback[msg.StreamIndex]
 			c.mu.Unlock()
 			if ok {
-				stream.request <- int(msg.Length)
+				select {
+				case stream.request <- int(msg.Length):
+				case <-stream.done:
+				}
 			}
 		case *proto.DataPacket:
 			c.mu.Lock()
@@ -94,8 +97,11 @@ func NewClient(opts ...ClientOption) (*Client, error) {
 			c.mu.Lock()
 			stream, ok := c.playback[msg.StreamIndex]
 			c.mu.Unlock()
-			if ok && stream.state.is(running) && !stream.underflow {
-				stream.started <- true
+			if ok && stream.state.is(running) {
+				select {
+				case stream.started <- true:
+				default:
+				}
 			}
 		case *proto.Underflow:
 			c.mu.Lock()
@@ -103,8 +109,18 @@ func NewClient(opts ...ClientOption) (*Client, error) {
 			c.mu.Unlock()
 			if ok {
 				if stream.state.is(running) {
-					stream.underflow = true
+					stream.setUnderflow(true)
 				}
+			}
+		case *proto.PlaybackStreamKilled:
+			c.mu.Lock()
+			stream, ok := c.playback[msg.StreamIndex]
+			if ok {
+				delete(c.playback, msg.StreamIndex)
+			}
+			c.mu.Unlock()
+			if ok {
+				stream.finish(errPlaybackStreamKilled)
 			}
 		case *proto.ConnectionClosed:
 			connectionErr := error(ErrConnectionClosed)
@@ -114,9 +130,7 @@ func NewClient(opts ...ClientOption) (*Client, error) {
 
 			c.mu.Lock()
 			for _, p := range c.playback {
-				close(p.request)
-				p.err = connectionErr
-				p.state.set(serverLost)
+				p.finish(connectionErr)
 			}
 			for _, r := range c.record {
 				r.err = connectionErr

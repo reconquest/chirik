@@ -2,6 +2,7 @@ package pulse
 
 import (
 	"sync"
+	"time"
 
 	"chirik/internal/pulse/proto"
 )
@@ -13,11 +14,15 @@ type PlaybackStream struct {
 
 	index     uint32
 	state     *stateMachine
+	mu        sync.RWMutex
 	underflow bool
 	err       error
 
-	request chan int
-	started chan bool
+	request   chan int
+	started   chan bool
+	done      chan struct{}
+	doneOnce  sync.Once
+	closeOnce sync.Once
 
 	events        chan struct{}
 	eventsLock    sync.Mutex
@@ -32,6 +37,13 @@ type PlaybackStream struct {
 
 // EndOfData is a special error value that can be returned by a reader to stop the stream.
 const EndOfData endOfData = false
+
+const (
+	playbackStartTimeout    = time.Second
+	errPlaybackStartTimeout = pulseError("pulseaudio: playback start timed out")
+	errPlaybackStreamClosed = pulseError("pulseaudio: playback stream closed")
+	errPlaybackStreamKilled = pulseError("pulseaudio: playback stream killed")
+)
 
 // NewPlayback creates a playback stream.
 // The created stream wil not be running, it must be started with Start().
@@ -81,8 +93,9 @@ func (c *Client) NewPlayback(r Reader, opts ...PlaybackOption) (*PlaybackStream,
 	}
 	p.index = p.createReply.StreamIndex
 	p.state = newStateMachine()
-	p.request = make(chan int)
-	p.started = make(chan bool)
+	p.request = make(chan int, 1)
+	p.started = make(chan bool, 1)
+	p.done = make(chan struct{})
 	c.mu.Lock()
 	c.playback[p.index] = p
 	c.mu.Unlock()
@@ -95,32 +108,45 @@ func (p *PlaybackStream) run() {
 	front := make([]byte, p.createReply.BufferMaxLength)
 	back := make([]byte, p.createReply.BufferMaxLength)
 
-	for bufferLength := range p.request {
-		if !p.state.is(running) {
-			continue
-		}
-		requested += bufferLength
-		for requested > 0 {
-			front, back = ensurePlaybackBuffers(front, back, requested)
-			readCount, err := p.r.Read(front[:requested])
-			if err != nil {
-				if err != EndOfData {
-					p.err = err
-				}
-				p.state.set(idle)
-				break
-			}
-			if readCount > 0 {
-				p.c.c.Send(p.index, front[:readCount])
-				requested -= readCount
-				front, back = back, front
+	for {
+		select {
+		case bufferLength := <-p.request:
+			if !p.state.is(running) {
+				continue
 			}
 
-			select {
-			case nextBufferLength := <-p.request:
-				requested += nextBufferLength
-			default:
+			requested += bufferLength
+			for requested > 0 {
+				front, back = ensurePlaybackBuffers(front, back, requested)
+				readCount, err := p.r.Read(front[:requested])
+				if err != nil {
+					if err != EndOfData {
+						p.setError(err)
+					}
+
+					p.state.transition(running, idle)
+					requested = 0
+
+					break
+				}
+
+				if readCount > 0 {
+					p.c.c.Send(p.index, front[:readCount])
+					requested -= readCount
+					front, back = back, front
+				}
+
+				select {
+				case nextBufferLength := <-p.request:
+					requested += nextBufferLength
+				case <-p.done:
+					return
+				default:
+				}
 			}
+
+		case <-p.done:
+			return
 		}
 	}
 }
@@ -195,16 +221,83 @@ func (p *PlaybackStream) handleEvents(events chan struct{}) {
 }
 
 // Start starts playing audio.
-func (p *PlaybackStream) Start() {
-	if p.state.is(idle) {
-		p.c.c.Request(&proto.FlushPlaybackStream{StreamIndex: p.index}, nil)
-		p.state.set(running)
-		p.err = nil
-		p.request <- int(p.createReply.BufferTargetLength)
-		p.underflow = false
-		p.c.c.Request(&proto.CorkPlaybackStream{StreamIndex: p.index, Corked: false}, nil)
-		<-p.started
+func (p *PlaybackStream) Start() error {
+	if p.Closed() {
+		return p.startError()
 	}
+
+	if !p.state.is(idle) {
+		return nil
+	}
+
+	err := p.c.c.Request(&proto.FlushPlaybackStream{StreamIndex: p.index}, nil)
+	if err != nil {
+		return err
+	}
+
+	select {
+	case <-p.started:
+	default:
+	}
+
+	if !p.state.transition(idle, running) {
+		if p.Closed() {
+			return p.startError()
+		}
+
+		return nil
+	}
+
+	p.setError(nil)
+	p.setUnderflow(false)
+
+	timer := time.NewTimer(playbackStartTimeout)
+	defer timer.Stop()
+
+	select {
+	case p.request <- int(p.createReply.BufferTargetLength):
+	case <-p.done:
+		return p.startError()
+	case <-timer.C:
+		p.state.transition(running, idle)
+
+		return errPlaybackStartTimeout
+	}
+
+	err = p.c.c.Request(&proto.CorkPlaybackStream{
+		StreamIndex: p.index,
+		Corked:      false,
+	}, nil)
+	if err != nil {
+		p.state.transition(running, idle)
+
+		return err
+	}
+
+	select {
+	case <-p.started:
+		if p.Closed() {
+			return p.startError()
+		}
+
+		return nil
+
+	case <-p.done:
+		return p.startError()
+
+	case <-timer.C:
+		p.state.transition(running, idle)
+
+		return errPlaybackStartTimeout
+	}
+}
+
+func (p *PlaybackStream) startError() error {
+	if err := p.Error(); err != nil {
+		return err
+	}
+
+	return errPlaybackStreamClosed
 }
 
 // Stop stops playing audio; the callback will no longer be called.
@@ -228,7 +321,7 @@ func (p *PlaybackStream) Resume() {
 	if p.state.is(paused) {
 		p.c.c.Request(&proto.CorkPlaybackStream{StreamIndex: p.index, Corked: false}, nil)
 		p.state.set(running)
-		p.underflow = false
+		p.setUnderflow(false)
 	}
 }
 
@@ -275,10 +368,13 @@ func (p *PlaybackStream) SetVolume(volumes proto.ChannelVolumes) error {
 
 // Close closes the stream.
 func (p *PlaybackStream) Close() {
-	if !p.Closed() {
-		p.c.c.Request(&proto.DeletePlaybackStream{StreamIndex: p.index}, nil)
+	p.closeOnce.Do(func() {
+		if !p.Closed() {
+			p.c.c.Request(&proto.DeletePlaybackStream{StreamIndex: p.index}, nil)
+		}
+
 		p.state.set(closed)
-		close(p.request)
+		p.doneOnce.Do(func() { close(p.done) })
 
 		p.c.mu.Lock()
 		delete(p.c.playback, p.index)
@@ -290,7 +386,7 @@ func (p *PlaybackStream) Close() {
 			p.events = nil
 		}
 		p.eventsLock.Unlock()
-	}
+	})
 }
 
 // Closed returns wether the stream was closed.
@@ -302,10 +398,40 @@ func (p *PlaybackStream) Running() bool { return p.state.is(running) }
 // Underflow returns true if any underflows happend since the last call to Start or Resume.
 // Underflows usually happen because the latency/buffer size is too low or because the callback
 // takes too long to run.
-func (p *PlaybackStream) Underflow() bool { return p.underflow }
+func (p *PlaybackStream) Underflow() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 
-// Error returns the last error returned by the stream's reader.
-func (p *PlaybackStream) Error() error { return p.err }
+	return p.underflow
+}
+
+func (p *PlaybackStream) setUnderflow(value bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.underflow = value
+}
+
+// Error returns the most recent playback or stream error.
+func (p *PlaybackStream) Error() error {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	return p.err
+}
+
+func (p *PlaybackStream) setError(err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.err = err
+}
+
+func (p *PlaybackStream) finish(err error) {
+	p.setError(err)
+	p.state.set(serverLost)
+	p.doneOnce.Do(func() { close(p.done) })
+}
 
 // SampleRate returns the stream's sample rate (samples per second).
 func (p *PlaybackStream) SampleRate() int {

@@ -39,13 +39,15 @@ type link struct {
 	responseReceived bool
 	connectedPrinted bool
 
-	kexNext          time.Time
-	kexDeadline      time.Time
-	requestNext      time.Time
-	responseDeadline time.Time
-	requestAttempts  int
-	lastKEXSent      time.Time
-	lastSeen         time.Time
+	kexNext              time.Time
+	kexDeadline          time.Time
+	requestNext          time.Time
+	registrationNext     time.Time
+	responseDeadline     time.Time
+	requestAttempts      int
+	registrationAttempts int
+	lastKEXSent          time.Time
+	lastSeen             time.Time
 
 	playback     audio.PlaybackWriter
 	concealer    audio.Concealer

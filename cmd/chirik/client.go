@@ -22,16 +22,19 @@ type client struct {
 	cfg          config
 	local        *net.UDPAddr
 	playbackOpen func(string) (audio.PlaybackWriter, error)
+	cueOpen      func(string) (audio.PlaybackWriter, error)
 	output       *output
 	logger       *log.Logger
 	debug        bool
 	stderr       io.Writer
 
-	links     map[string][]*link
-	seen      map[proto.Handle]struct{}
-	discovery *discoveryEngine
+	cuePlayback audio.PlaybackWriter
+	links       map[string][]*link
+	seen        map[proto.Handle]struct{}
+	discovery   *discoveryEngine
 
 	frames   chan []byte
+	cues     chan peerCue
 	commands chan byte
 	events   chan error
 	muted    atomic.Bool
@@ -47,7 +50,11 @@ type client struct {
 
 type manager = client
 
-const clientTickInterval = 100 * time.Millisecond
+const (
+	clientTickInterval         = 100 * time.Millisecond
+	peerexRegistrationInterval = 30 * time.Second
+	peerexRegistrationAttempts = 3
+)
 
 const (
 	commandInterrupt = byte(0x03)
@@ -57,7 +64,7 @@ const (
 
 func (client *client) run() error {
 	if client.logger == nil {
-		client.logger = loggerNew(client.stderr)
+		client.logger = loggerNew(client.stderr, client.debug)
 	}
 
 	ticker := time.NewTicker(clientTickInterval)
@@ -211,6 +218,10 @@ func (client *client) linkTick(item *link, now time.Time) error {
 }
 
 func (client *client) linkKEXTick(item *link, now time.Time) error {
+	if client.relayFallbackDefer(item, now) {
+		return nil
+	}
+
 	if now.After(item.kexDeadline) {
 		return client.linkTickError(item, errors.New("key exchange timed out"))
 	}
@@ -248,6 +259,21 @@ func (client *client) linkRequestTick(item *link, now time.Time) error {
 }
 
 func (client *client) linkActiveTick(item *link, now time.Time) error {
+	if item.peerex {
+		return client.peerexActiveTick(item, now)
+	}
+
+	probeExpired := item.relay && !item.responseReceived &&
+		!item.responseDeadline.IsZero() && now.After(item.responseDeadline)
+	if probeExpired {
+		err := client.relayCandidateRestart(item, now)
+		if err != nil {
+			return client.linkTickError(item, err)
+		}
+
+		return nil
+	}
+
 	if requestSendDue(item, now) {
 		err := client.linkRequestSend(item, now)
 		if err != nil {
@@ -255,9 +281,37 @@ func (client *client) linkActiveTick(item *link, now time.Time) error {
 		}
 	}
 
-	if !item.peerex &&
-		now.Sub(item.lastSeen) > client.discoveryEnsure().policy.ttl {
+	if now.Sub(item.lastSeen) > client.discoveryEnsure().policy.ttl {
 		client.linkRemove(item, "expired")
+	}
+
+	return nil
+}
+
+func (client *client) peerexActiveTick(item *link, now time.Time) error {
+	responseExpired := !item.responseReceived &&
+		!item.responseDeadline.IsZero() && now.After(item.responseDeadline)
+	if responseExpired {
+		if item.registrationAttempts < peerexRegistrationAttempts {
+			item.responseDeadline = time.Time{}
+			item.registrationNext = now.Add(proto.RequestInterval)
+
+			return nil
+		}
+
+		return client.linkTickError(
+			item,
+			errors.New("exchange registration timed out"),
+		)
+	}
+
+	if item.registrationNext.IsZero() || now.Before(item.registrationNext) {
+		return nil
+	}
+
+	err := client.peerexRegistrationSend(item, now)
+	if err != nil {
+		return client.linkTickError(item, err)
 	}
 
 	return nil
@@ -280,7 +334,8 @@ func requestSendDue(item *link, now time.Time) bool {
 	}
 
 	if item.state == linkState_Active {
-		return !item.peerex && item.initiated && !item.responseReceived
+		return !item.peerex && !item.responseReceived &&
+			(item.initiated || item.relay)
 	}
 
 	return !item.peerex || item.initiated
@@ -301,6 +356,12 @@ func (client *client) markReady(item *link) {
 }
 
 func (client *client) close() {
+	if client.cuePlayback != nil {
+		client.cuePlayback.Close()
+
+		client.cuePlayback = nil
+	}
+
 	for _, links := range client.links {
 		for _, item := range links {
 			if item.playback != nil {

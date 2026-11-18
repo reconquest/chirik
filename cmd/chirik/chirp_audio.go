@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"io"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -15,7 +16,144 @@ import (
 	"chirik/internal/proto"
 )
 
-const pcmSampleBytes = 2
+const (
+	pcmSampleBytes = 2
+
+	peerCueWriteAttempts     = 2
+	peerCueNoteCount         = 3
+	peerCueNoteSamples       = proto.SampleRate * 50 / 1000
+	peerCueAmplitude         = 5500.0
+	peerCueHarmonicAmplitude = 0.25
+	peerCueHarmonicRatio     = 2.0
+	peerCueSweepMin          = 0.85
+	peerCueSweepMax          = 1.15
+)
+
+type peerCue byte
+
+const (
+	peerCueConnect peerCue = iota
+	peerCueDisconnect
+)
+
+func (client *client) peerCueQueue(cue peerCue) {
+	if client.cueOpen == nil {
+		return
+	}
+
+	select {
+	case client.cues <- cue:
+	default:
+	}
+}
+
+func (client *client) peerCuePlay(cue peerCue) {
+	if client.cueOpen == nil {
+		return
+	}
+
+	data := peerCuePCM(cue)
+	for range peerCueWriteAttempts {
+		err := client.peerCueWrite(data)
+		if err == nil {
+			return
+		}
+
+		client.peerCueError(err)
+	}
+}
+
+func (client *client) peerCueWrite(data []byte) error {
+	if client.cuePlayback == nil {
+		playback, err := client.cueOpen("chirik peer events")
+		if err != nil {
+			return karma.Format(err, "open peer cue playback")
+		}
+
+		client.cuePlayback = playback
+	}
+
+	written, err := client.cuePlayback.Write(data)
+	if err == nil && written != len(data) {
+		err = io.ErrShortWrite
+	}
+
+	if err == nil {
+		return nil
+	}
+
+	client.cuePlayback.Close()
+
+	client.cuePlayback = nil
+
+	return karma.Format(err, "write peer cue playback")
+}
+
+func (client *client) peerCueError(err error) {
+	if client.logger != nil {
+		client.logger.Print("ERROR ", err)
+	}
+}
+
+func cueRun(
+	ctx context.Context,
+	workers *sync.WaitGroup,
+	client *client,
+) {
+	defer workers.Done()
+
+	for {
+		select {
+		case cue := <-client.cues:
+			client.peerCuePlay(cue)
+
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func peerCuePCM(cue peerCue) []byte {
+	data := make([]byte, peerCueNoteCount*peerCueNoteSamples*pcmSampleBytes)
+	phase := 0.0
+
+	for note := range peerCueNoteCount {
+		frequency := peerCueFrequency(cue, note)
+
+		for index := range peerCueNoteSamples {
+			progress := float64(index) / float64(peerCueNoteSamples-1)
+			sweep := peerCueSweepMin +
+				(peerCueSweepMax-peerCueSweepMin)*progress
+
+			if cue == peerCueDisconnect {
+				sweep = peerCueSweepMax -
+					(peerCueSweepMax-peerCueSweepMin)*progress
+			}
+
+			phase += 2 * math.Pi * frequency * sweep / proto.SampleRate
+
+			envelope := math.Sin(math.Pi * progress)
+			sample := peerCueAmplitude * envelope *
+				(math.Sin(phase) + peerCueHarmonicAmplitude*
+					math.Sin(peerCueHarmonicRatio*phase))
+			offset := (note*peerCueNoteSamples + index) * pcmSampleBytes
+			binary.LittleEndian.PutUint16(
+				data[offset:],
+				uint16(int16(sample)),
+			)
+		}
+	}
+
+	return data
+}
+
+func peerCueFrequency(cue peerCue, note int) float64 {
+	if cue == peerCueConnect {
+		return [peerCueNoteCount]float64{480, 960, 1440}[note]
+	}
+
+	return [peerCueNoteCount]float64{1440, 720, 240}[note]
+}
 
 func (client *client) audioSend(payload []byte) {
 	for _, links := range client.links {

@@ -17,9 +17,10 @@ import (
 )
 
 const (
-	exitUsage         = 2
-	clientQueueSize   = 8
-	clientWorkerCount = 3
+	exitUsage          = 2
+	clientQueueSize    = 8
+	clientCueQueueSize = 32
+	clientWorkerCount  = 4
 )
 
 type clientOptions struct {
@@ -27,6 +28,7 @@ type clientOptions struct {
 	config       config
 	local        *net.UDPAddr
 	playbackOpen func(string) (audio.PlaybackWriter, error)
+	cueOpen      func(string) (audio.PlaybackWriter, error)
 	stdout       io.Writer
 	stderr       io.Writer
 	logger       *log.Logger
@@ -63,7 +65,7 @@ func chirpRun(args []string, stdout, stderr io.Writer) int {
 		return output.code
 	}
 
-	logger := loggerNew(stderr)
+	logger := loggerNew(stderr, cfg.debug)
 
 	device, err := chirpAudioOpen(&cfg)
 	if err != nil {
@@ -174,17 +176,20 @@ func chirpClientOptions(
 	stdout, stderr io.Writer,
 	logger *log.Logger,
 ) clientOptions {
+	playbackOpen := func(name string) (audio.PlaybackWriter, error) {
+		return device.PlaybackOpen(name)
+	}
+
 	return clientOptions{
-		transport: transport,
-		config:    *cfg,
-		local:     local,
-		playbackOpen: func(name string) (audio.PlaybackWriter, error) {
-			return device.PlaybackOpen(name)
-		},
-		stdout: stdout,
-		stderr: stderr,
-		logger: logger,
-		debug:  os.Getenv("CHIRIK_DEBUG") != "",
+		transport:    transport,
+		config:       *cfg,
+		local:        local,
+		playbackOpen: playbackOpen,
+		cueOpen:      playbackOpen,
+		stdout:       stdout,
+		stderr:       stderr,
+		logger:       logger,
+		debug:        cfg.debug,
 	}
 }
 
@@ -198,6 +203,7 @@ func chirpClientNew(
 		cfg:          options.config,
 		local:        options.local,
 		playbackOpen: options.playbackOpen,
+		cueOpen:      options.cueOpen,
 		output:       &output{writer: options.stdout, logger: options.logger},
 		logger:       options.logger,
 		debug:        options.debug,
@@ -205,6 +211,7 @@ func chirpClientNew(
 		links:        make(map[string][]*link),
 		seen:         map[proto.Handle]struct{}{options.config.handle: {}},
 		frames:       make(chan []byte, clientQueueSize),
+		cues:         make(chan peerCue, clientCueQueueSize),
 		commands:     make(chan byte, clientQueueSize),
 		events:       make(chan error, clientQueueSize),
 		readyCh:      make(chan struct{}),
@@ -269,6 +276,7 @@ func clientWorkersStart(
 	)
 	go keyboardRun(ctx, workers, client.events, client.commands, term)
 	go audioMonitor(ctx, workers, client.events, device)
+	go cueRun(ctx, workers, client)
 
 	return workers
 }

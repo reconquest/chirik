@@ -161,7 +161,13 @@ func (device *Device) PlaybackOpen(mediaName string) (*Playback, error) {
 		return nil, karma.Format(err, "create playback stream")
 	}
 
-	stream.Start()
+	err = stream.Start()
+	if err != nil {
+		stream.Close()
+		buffer.Close()
+
+		return nil, karma.Format(err, "start playback stream")
+	}
 
 	playback := &Playback{
 		device: device,
@@ -216,6 +222,15 @@ func (device *Device) Close() {
 func (playback *Playback) Write(
 	data []byte,
 ) (int, error) {
+	if playback.stream.Closed() {
+		err := playback.stream.Error()
+		if err == nil {
+			err = io.ErrClosedPipe
+		}
+
+		return 0, err
+	}
+
 	return playback.buffer.Write(data)
 }
 

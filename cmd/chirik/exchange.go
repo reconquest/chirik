@@ -68,7 +68,7 @@ func exchangeRun(args []string, stderr io.Writer, outputs ...io.Writer) int {
 		return code
 	}
 
-	logger := loggerNew(stderr)
+	logger := loggerNew(stderr, false)
 
 	addr, err := exchangeAddrResolve(arguments.ValueListen)
 	if err != nil {

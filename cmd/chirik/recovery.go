@@ -97,8 +97,10 @@ func (client *client) peerexRecoveryStart(now time.Time) error {
 	item.kexNext = time.Time{}
 	item.kexDeadline = now.Add(proto.KEXTimeout)
 	item.requestNext = time.Time{}
+	item.registrationNext = time.Time{}
 	item.responseDeadline = time.Time{}
 	item.requestAttempts = 0
+	item.registrationAttempts = 0
 	item.lastKEXSent = time.Time{}
 	item.lastSeen = now
 	client.peerexRecoveryStarted = true

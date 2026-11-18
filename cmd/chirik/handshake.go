@@ -183,6 +183,9 @@ func (client *client) linkKEXComplete(
 	item.voice = voice
 	item.lastSeen = now
 	item.state = linkState_Request
+	item.responseReceived = false
+	item.requestAttempts = 0
+	item.requestNext = time.Time{}
 	item.responseDeadline = now.Add(proto.ResponseTimeout)
 
 	publicKey := base64.StdEncoding.EncodeToString(peerPublic[:])
@@ -288,6 +291,12 @@ func (client *client) requestHandle(
 	item.handle = handle
 	item.handleKnown = true
 
+	if client.directRoutePreferred(item, now) {
+		client.linkRemove(item, linkRemovalReplaced)
+
+		return true
+	}
+
 	err := client.linkPromote(item, now)
 	if err != nil {
 		client.linkFail(item, err)
@@ -322,6 +331,12 @@ func (client *client) peerListHandle(
 
 	peerListIdentity(item)
 
+	if client.directRoutePreferred(item, now) {
+		client.linkRemove(item, linkRemovalReplaced)
+
+		return true
+	}
+
 	membershipChanged, err := client.peerListPromote(item, audioPeer, now)
 	if err != nil {
 		client.linkFail(item, err)
@@ -329,9 +344,12 @@ func (client *client) peerListHandle(
 		return false
 	}
 
-	client.peerListExchangeActivate(item)
+	registrationReply := item.peerex && len(records) == 0
+	client.peerListExchangeActivate(item, now, registrationReply)
 
-	item.responseReceived = true
+	if !item.peerex {
+		item.responseReceived = true
+	}
 
 	listChanged := client.peerListMerge(item, records, now, membershipChanged)
 	client.markReady(item)
@@ -373,17 +391,34 @@ func (client *client) peerListPromote(
 	return membershipChanged, nil
 }
 
-func (client *client) peerListExchangeActivate(item *link) {
+func (client *client) peerListExchangeActivate(
+	item *link,
+	now time.Time,
+	registrationReply bool,
+) {
 	if !item.peerex {
 		return
 	}
 
 	recovered := client.peerexRecoveryRequired
+	active := item.stateActive()
 
 	item.state = linkState_Active
 	item.requestAttempts = 0
 	item.requestNext = time.Time{}
-	item.responseDeadline = time.Time{}
+
+	if !active || registrationReply {
+		item.registrationNext = time.Time{}
+
+		if item.initiated {
+			item.registrationNext = now.Add(peerexRegistrationInterval)
+		}
+
+		item.responseDeadline = time.Time{}
+		item.responseReceived = true
+		item.registrationAttempts = 0
+	}
+
 	client.peerexRecoveryRequired = false
 	client.peerexRecoveryStarted = false
 

@@ -13,6 +13,11 @@ import (
 	"chirik/internal/proto"
 )
 
+const (
+	linkRemovalReplaced  = "replaced"
+	directRouteFreshness = 2 * proto.RelayFallbackDelay
+)
+
 func (client *client) peerRecords(exclude proto.Handle) []proto.PeerRecord {
 	var records []proto.PeerRecord
 
@@ -66,15 +71,11 @@ func (client *client) candidateAdd(
 	}
 
 	tracked, directExists := client.candidatePresence(record)
-	if directExists || (tracked && !allowReplacement) {
-		if allowReplacement {
-			return client.relayCandidateAdd(
-				record.Handle,
-				now,
-				proto.RelayFallbackDelay,
-			)
-		}
+	if directExists {
+		return client.existingDirectRelayAdd(record, allowReplacement, now)
+	}
 
+	if tracked && !allowReplacement {
 		return false
 	}
 
@@ -96,6 +97,22 @@ func (client *client) candidateAdd(
 	}
 
 	return directAdded || relayAdded
+}
+
+func (client *client) existingDirectRelayAdd(
+	record proto.PeerRecord,
+	allowReplacement bool,
+	now time.Time,
+) bool {
+	if !allowReplacement {
+		return false
+	}
+
+	return client.relayCandidateAdd(
+		record.Handle,
+		now,
+		proto.RelayFallbackDelay,
+	)
 }
 
 func (client *client) candidatePresence(
@@ -155,18 +172,46 @@ func (client *client) directCandidateAdd(
 }
 
 func (client *client) linkPromote(item *link, now time.Time) error {
-	client.linkReplaceCompetitors(item)
+	routeReplacement := client.peerRouteAnnounced(item)
+	activate := !item.stateActive()
 
 	err := client.linkPlaybackEnsure(item)
 	if err != nil {
 		return err
 	}
 
+	if activate {
+		client.linkReplaceCompetitors(item)
+	}
+
 	item.state = linkState_Active
 	item.lastSeen = now
-	client.linkConnectedPrint(item)
+
+	announced := client.linkConnectedNotify(item)
+	if announced && !routeReplacement {
+		client.peerCueQueue(peerCueConnect)
+	}
 
 	return nil
+}
+
+func (client *client) peerRouteAnnounced(candidate *link) bool {
+	if !candidate.handleKnown {
+		return false
+	}
+
+	for _, links := range client.links {
+		for _, item := range links {
+			if item == candidate || item.peerex || !item.connectedPrinted ||
+				!item.matchesHandle(candidate.handle) {
+				continue
+			}
+
+			return true
+		}
+	}
+
+	return false
 }
 
 func (client *client) linkReplaceCompetitors(item *link) {
@@ -181,7 +226,7 @@ func (client *client) linkReplaceCompetitors(item *link) {
 			}
 
 			if other.matchesHandle(item.handle) {
-				client.linkRemove(other, "replaced")
+				client.linkRemove(other, linkRemovalReplaced)
 			}
 		}
 	}
@@ -206,9 +251,9 @@ func (client *client) linkPlaybackEnsure(item *link) error {
 	return nil
 }
 
-func (client *client) linkConnectedPrint(item *link) {
+func (client *client) linkConnectedNotify(item *link) bool {
 	if !item.handleKnown || item.connectedPrinted {
-		return
+		return false
 	}
 
 	client.output.lineWrite(
@@ -216,6 +261,8 @@ func (client *client) linkConnectedPrint(item *link) {
 	)
 
 	item.connectedPrinted = true
+
+	return true
 }
 
 func (client *client) linkAdd(item *link) {
@@ -225,15 +272,21 @@ func (client *client) linkAdd(item *link) {
 }
 
 func (client *client) linkRemove(item *link, reason string) {
-	if item.peerex && client.peerexRecoveryRequired {
-		client.peerexRecoveryStarted = false
+	if item.peerex {
+		if item.stateActive() && client.ready {
+			client.peerexRecoveryRequired = true
+		}
+
+		if client.peerexRecoveryRequired {
+			client.peerexRecoveryStarted = false
+		}
 	}
 
 	membershipChanged := linkMembershipChanged(item)
 	client.linkIndexRemove(item)
 	client.linkSeenRemove(item)
 	linkPlaybackClose(item)
-	client.linkRemovedPrint(item, reason)
+	client.linkRemovedNotify(item, reason)
 
 	if membershipChanged {
 		client.peerListBroadcast()
@@ -263,7 +316,7 @@ func linkPlaybackClose(item *link) {
 	item.playback = nil
 }
 
-func (client *client) linkRemovedPrint(item *link, reason string) {
+func (client *client) linkRemovedNotify(item *link, reason string) {
 	if !item.connectedPrinted {
 		return
 	}
@@ -276,6 +329,10 @@ func (client *client) linkRemovedPrint(item *link, reason string) {
 			reason,
 		),
 	)
+
+	if reason != linkRemovalReplaced {
+		client.peerCueQueue(peerCueDisconnect)
+	}
 }
 
 func (client *client) linkIndexRemove(item *link) {
@@ -295,6 +352,39 @@ func (client *client) linkIndexRemove(item *link) {
 	} else {
 		client.links[key] = links
 	}
+}
+
+func (client *client) directRoutePreferred(
+	candidate *link,
+	now time.Time,
+) bool {
+	handle, known := candidate.identity()
+	if candidate.peerex || !known {
+		return false
+	}
+
+	for _, links := range client.links {
+		for _, item := range links {
+			if !directRouteMatches(item, candidate, handle) {
+				continue
+			}
+
+			if now.Sub(item.lastSeen) <= directRouteFreshness {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+func directRouteMatches(
+	item *link,
+	candidate *link,
+	handle proto.Handle,
+) bool {
+	return item != candidate && !item.peerex && !item.relay &&
+		item.stateActive() && item.audioEligible && item.matchesHandle(handle)
 }
 
 func (client *client) peerHandleTracked(handle proto.Handle) bool {
@@ -351,18 +441,9 @@ func (client *client) linkRequestSend(item *link, now time.Time) error {
 		return nil
 	}
 
-	payload, ok := proto.Request(
-		client.cfg.handle,
-		client.cfg.channel,
-		client.local,
-	)
-	if !ok {
-		return errors.New("encode peer request")
-	}
-
-	packet, err := item.voice.Seal(proto.Type_Request, payload)
+	packet, err := client.linkRequestPacket(item)
 	if err != nil {
-		return karma.Format(err, "encrypt peer request")
+		return err
 	}
 
 	if item.relay {
@@ -382,4 +463,48 @@ func (client *client) linkRequestSend(item *link, now time.Time) error {
 	item.requestNext = now.Add(proto.RequestInterval)
 
 	return nil
+}
+
+func (client *client) peerexRegistrationSend(
+	item *link,
+	now time.Time,
+) error {
+	if item.voice == nil {
+		return errors.New("exchange session unavailable")
+	}
+
+	packet, err := client.linkRequestPacket(item)
+	if err != nil {
+		return err
+	}
+
+	err = datagramSend(client.t.conn, item.addr, packet)
+	if err != nil {
+		return karma.Format(err, "send exchange registration")
+	}
+
+	item.registrationNext = now.Add(peerexRegistrationInterval)
+	item.responseDeadline = now.Add(proto.ResponseTimeout)
+	item.responseReceived = false
+	item.registrationAttempts++
+
+	return nil
+}
+
+func (client *client) linkRequestPacket(item *link) ([]byte, error) {
+	payload, ok := proto.Request(
+		client.cfg.handle,
+		client.cfg.channel,
+		client.local,
+	)
+	if !ok {
+		return nil, errors.New("encode peer request")
+	}
+
+	packet, err := item.voice.Seal(proto.Type_Request, payload)
+	if err != nil {
+		return nil, karma.Format(err, "encrypt peer request")
+	}
+
+	return packet, nil
 }

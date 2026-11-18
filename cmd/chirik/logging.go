@@ -3,7 +3,6 @@ package main
 import (
 	"io"
 	"log"
-	"os"
 	"strings"
 	"time"
 
@@ -19,9 +18,9 @@ type logIndentWriter struct {
 	indent string
 }
 
-func loggerNew(writer io.Writer) *log.Logger {
+func loggerNew(writer io.Writer, debug bool) *log.Logger {
 	level := charmlog.InfoLevel
-	if os.Getenv("CHIRIK_DEBUG") != "" {
+	if debug {
 		level = charmlog.DebugLevel
 	}
 

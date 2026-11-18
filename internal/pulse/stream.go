@@ -32,6 +32,19 @@ func (s *stateMachine) set(state streamState) {
 	s.state = state
 }
 
+func (s *stateMachine) transition(from, to streamState) bool {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	if s.state != from {
+		return false
+	}
+
+	s.state = to
+
+	return true
+}
+
 func (s *stateMachine) get() streamState {
 	s.lock.RLock()
 	defer s.lock.RUnlock()

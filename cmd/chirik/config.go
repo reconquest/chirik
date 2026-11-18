@@ -56,6 +56,7 @@ Options:`
 const chirpUsageSuffix = `
   --source=<name>  Pulse source name (empty selects the server default).
   --sink=<name>    Pulse sink name (empty selects the server default).
+  --debug          Enable debug packet statistics.
   -h, --help
         Show this help.
 
@@ -63,9 +64,6 @@ Interactive controls:
   m       Toggle microphone mute.
   q       Quit.
   Ctrl-C  Quit. SIGTERM also stops the process.
-
-Environment:
-  CHIRIK_DEBUG=1  Enable debug packet statistics.
 
 Examples:
   chirik chirp alice@exchange.example:7777/team-room
@@ -80,6 +78,7 @@ type config struct {
 	peerex     *net.UDPAddr
 	source     string
 	sink       string
+	debug      bool
 }
 
 type configParseOutput struct {
@@ -94,6 +93,7 @@ type cliArguments struct {
 	ValueSource  string `docopt:"--source"`
 	ValueSink    string `docopt:"--sink"`
 	ValueListen  string `docopt:"<listen-address>"`
+	FlagDebug    bool   `docopt:"--debug"`
 }
 
 func argumentsParse(
@@ -160,7 +160,11 @@ func configParse(
 		return config{}, false
 	}
 
-	cfg := config{source: arguments.ValueSource, sink: arguments.ValueSink}
+	cfg := config{
+		source: arguments.ValueSource,
+		sink:   arguments.ValueSink,
+		debug:  arguments.FlagDebug,
+	}
 
 	err := configTargetParse(arguments.ValueTarget, &cfg)
 	if err != nil {

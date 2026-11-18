@@ -48,6 +48,21 @@ func (client *client) relayLink(handle proto.Handle) *link {
 	return nil
 }
 
+func (client *client) relayFallbackDefer(item *link, now time.Time) bool {
+	if !item.relay {
+		return false
+	}
+
+	if !client.directRoutePreferred(item, now) {
+		return false
+	}
+
+	item.kexNext = now.Add(proto.RelayFallbackDelay)
+	item.kexDeadline = item.kexNext.Add(proto.KEXTimeout)
+
+	return true
+}
+
 func (client *client) relayCandidateAdd(
 	handle proto.Handle,
 	now time.Time,
@@ -58,7 +73,11 @@ func (client *client) relayCandidateAdd(
 	}
 
 	existing := client.relayLink(handle)
-	if existing != nil && !existing.stateActive() {
+	if existing != nil {
+		if existing.stateActive() && existing.responseReceived {
+			client.relayCandidateProbe(existing, now, delay)
+		}
+
 		return false
 	}
 
@@ -68,12 +87,6 @@ func (client *client) relayCandidateAdd(
 	}
 
 	start := now.Add(delay)
-	if existing != nil {
-		relayCandidateReset(existing, pair, start)
-
-		return client.relayCandidateSend(existing, now, delay)
-	}
-
 	item := &link{
 		addr:           addrCopy(client.cfg.peerex),
 		pair:           pair,
@@ -92,11 +105,28 @@ func (client *client) relayCandidateAdd(
 	return client.relayCandidateSend(item, now, delay)
 }
 
-func relayCandidateReset(
+func (client *client) relayCandidateProbe(
 	item *link,
-	pair *sessioncrypto.KeyPair,
-	start time.Time,
+	now time.Time,
+	delay time.Duration,
 ) {
+	item.responseReceived = false
+	item.responseDeadline = now.Add(delay)
+	item.requestAttempts = 0
+	item.requestNext = now
+
+	err := client.linkRequestSend(item, now)
+	if err != nil {
+		client.linkRemove(item, err.Error())
+	}
+}
+
+func (client *client) relayCandidateRestart(item *link, now time.Time) error {
+	pair, err := sessioncrypto.KeyPairGenerate()
+	if err != nil {
+		return karma.Format(err, "generate relay key pair")
+	}
+
 	item.pair = pair
 	item.peerPublic = [sessioncrypto.PublicKeyBytes]byte{}
 	item.voice = nil
@@ -104,12 +134,14 @@ func relayCandidateReset(
 	item.initiated = true
 	item.audioEligible = false
 	item.responseReceived = false
-	item.kexNext = start
-	item.kexDeadline = start.Add(proto.KEXTimeout)
+	item.kexNext = now
+	item.kexDeadline = now.Add(proto.KEXTimeout)
 	item.requestNext = time.Time{}
 	item.responseDeadline = time.Time{}
 	item.requestAttempts = 0
 	item.lastKEXSent = time.Time{}
+
+	return client.linkKEXSend(item, now)
 }
 
 func (client *client) relayCandidateSend(

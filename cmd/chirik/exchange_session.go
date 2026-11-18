@@ -20,13 +20,14 @@ type exchangeEntry struct {
 }
 
 type exchangeSession struct {
-	addr       *net.UDPAddr
-	peerPublic [sessioncrypto.PublicKeyBytes]byte
-	voice      *sessioncrypto.Session
-	seen       time.Time
-	registered bool
-	handle     proto.Handle
-	channel    string
+	addr             *net.UDPAddr
+	peerPublic       [sessioncrypto.PublicKeyBytes]byte
+	voice            *sessioncrypto.Session
+	seen             time.Time
+	registrationSeen time.Time
+	registered       bool
+	handle           proto.Handle
+	channel          string
 }
 
 func (server *exchangeServer) kexHandle(
@@ -150,6 +151,9 @@ func (server *exchangeServer) registrationHandle(
 	channel string,
 	now time.Time,
 ) {
+	reannounce := session.registered &&
+		now.Sub(session.registrationSeen) >= proto.ResponseTimeout
+
 	changed, registered := server.registrationUpdate(
 		session,
 		addr,
@@ -184,7 +188,7 @@ func (server *exchangeServer) registrationHandle(
 		server.logger.Print("ERROR ", err)
 	}
 
-	if changed {
+	if changed || reannounce {
 		broadcastErr := discovery.broadcastRecordsExcept(
 			channel,
 			recipient,
@@ -234,6 +238,7 @@ func (server *exchangeServer) registrationUpdate(
 	session.handle = handle
 	session.channel = channel
 	session.seen = now
+	session.registrationSeen = now
 
 	return changed, true
 }

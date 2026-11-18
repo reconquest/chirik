@@ -39,7 +39,7 @@ func (client *client) peerListBroadcastReport(err error) {
 
 	logger := client.logger
 	if logger == nil {
-		logger = loggerNew(client.stderr)
+		logger = loggerNew(client.stderr, client.debug)
 	}
 
 	logger.Print("ERROR ", karma.Format(err, "broadcast peer list"))
