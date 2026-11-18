@@ -143,10 +143,7 @@ func (device *Device) PlaybackOpen(mediaName string) (*Playback, error) {
 		pulse.PlaybackChannels(pulseproto.ChannelMap{pulseproto.ChannelMono}),
 		pulse.PlaybackBufferSize(proto.FrameSamples),
 		pulse.PlaybackMediaName(mediaName),
-	}
-
-	if device.sink != nil {
-		options = append(options, pulse.PlaybackSink(device.sink))
+		pulse.PlaybackSink(device.sink),
 	}
 
 	if device.closedState() {
@@ -279,7 +276,12 @@ func devicesResolve(
 		}
 	}
 
-	if sinkID != "" {
+	if sinkID == "" {
+		sink, err = client.DefaultSink()
+		if err != nil {
+			return nil, nil, karma.Format(err, "find default sink")
+		}
+	} else {
 		sink, err = client.SinkByID(sinkID)
 		if err != nil {
 			return nil, nil, karma.Describe("sink_id", sinkID).
