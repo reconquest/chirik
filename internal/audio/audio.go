@@ -129,6 +129,13 @@ func Open(sourceID, sinkID string) (*Device, error) {
 	}, nil
 }
 
+func (device *Device) closedState() bool {
+	device.mu.Lock()
+	defer device.mu.Unlock()
+
+	return device.closed
+}
+
 func (device *Device) PlaybackOpen(mediaName string) (*Playback, error) {
 	buffer := pcmBufferNew(true)
 	options := []pulse.PlaybackOption{
@@ -142,10 +149,7 @@ func (device *Device) PlaybackOpen(mediaName string) (*Playback, error) {
 		options = append(options, pulse.PlaybackSink(device.sink))
 	}
 
-	device.mu.Lock()
-	defer device.mu.Unlock()
-
-	if device.closed {
+	if device.closedState() {
 		buffer.Close()
 
 		return nil, errors.New("audio device closed")
@@ -175,7 +179,18 @@ func (device *Device) PlaybackOpen(mediaName string) (*Playback, error) {
 		stream: stream,
 	}
 
+	device.mu.Lock()
+
+	if device.closed {
+		device.mu.Unlock()
+		stream.Close()
+		buffer.Close()
+
+		return nil, errors.New("audio device closed")
+	}
+
 	device.playbacks[playback] = struct{}{}
+	device.mu.Unlock()
 
 	return playback, nil
 }

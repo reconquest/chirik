@@ -26,6 +26,10 @@ type Client struct {
 	Callback func(interface{})
 }
 
+type writeDeadlineSetter interface {
+	SetWriteDeadline(time.Time) error
+}
+
 type send struct {
 	index uint32
 	data  []byte
@@ -78,6 +82,12 @@ func (c *Client) Request(req RequestArgs, rpl Reply) error {
 	c.awaitReply[tag] = AwaitReply{rpl, reply}
 	c.replyM.Unlock()
 
+	defer func() {
+		c.replyM.Lock()
+		delete(c.awaitReply, tag)
+		c.replyM.Unlock()
+	}()
+
 	var buf bytes.Buffer
 	w := ProtocolWriter{w: &buf}
 	w.byte('L')
@@ -103,17 +113,41 @@ func (c *Client) Request(req RequestArgs, rpl Reply) error {
 
 func (c *Client) Send(index uint32, data []byte) error {
 	c.writeM.Lock()
+	defer c.writeM.Unlock()
+
 	if c.err != nil {
-		c.writeM.Unlock()
 		return c.err
 	}
+
+	if c.timeout > 0 {
+		writer, ok := c.w.w.(writeDeadlineSetter)
+		if ok {
+			err := writer.SetWriteDeadline(time.Now().Add(c.timeout))
+			if err != nil {
+				return err
+			}
+		}
+	}
+
 	c.w.uint32(uint32(len(data)))
 	c.w.uint32(index)
 	c.w.uint64(0)
 	c.w.uint32(0)
 	c.w.flush()
-	c.w.w.Write(data)
-	c.writeM.Unlock()
+
+	if c.w.err != nil {
+		return c.w.err
+	}
+
+	written, err := c.w.w.Write(data)
+	if err != nil {
+		return err
+	}
+
+	if written != len(data) {
+		return io.ErrShortWrite
+	}
+
 	return nil
 }
 

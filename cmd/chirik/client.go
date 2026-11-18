@@ -266,12 +266,7 @@ func (client *client) linkActiveTick(item *link, now time.Time) error {
 	probeExpired := item.relay && !item.responseReceived &&
 		!item.responseDeadline.IsZero() && now.After(item.responseDeadline)
 	if probeExpired {
-		err := client.relayCandidateRestart(item, now)
-		if err != nil {
-			return client.linkTickError(item, err)
-		}
-
-		return nil
+		return client.relayProbeExpire(item, now)
 	}
 
 	if requestSendDue(item, now) {
@@ -283,6 +278,24 @@ func (client *client) linkActiveTick(item *link, now time.Time) error {
 
 	if now.Sub(item.lastSeen) > client.discoveryEnsure().policy.ttl {
 		client.linkRemove(item, "expired")
+	}
+
+	return nil
+}
+
+func (client *client) relayProbeExpire(item *link, now time.Time) error {
+	if item.lastSeen.After(item.probeStarted) {
+		item.responseReceived = true
+		item.responseDeadline = time.Time{}
+		item.probeStarted = time.Time{}
+		item.requestAttempts = 0
+
+		return nil
+	}
+
+	err := client.relayCandidateRestart(item, now)
+	if err != nil {
+		return client.linkTickError(item, err)
 	}
 
 	return nil

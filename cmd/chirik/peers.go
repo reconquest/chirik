@@ -173,14 +173,13 @@ func (client *client) directCandidateAdd(
 
 func (client *client) linkPromote(item *link, now time.Time) error {
 	routeReplacement := client.peerRouteAnnounced(item)
-	activate := !item.stateActive()
 
 	err := client.linkPlaybackEnsure(item)
 	if err != nil {
 		return err
 	}
 
-	if activate {
+	if !item.connectedPrinted {
 		client.linkReplaceCompetitors(item)
 	}
 
@@ -359,7 +358,7 @@ func (client *client) directRoutePreferred(
 	now time.Time,
 ) bool {
 	handle, known := candidate.identity()
-	if candidate.peerex || !known {
+	if candidate.peerex || !candidate.relay || !known {
 		return false
 	}
 

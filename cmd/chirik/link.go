@@ -48,6 +48,7 @@ type link struct {
 	registrationAttempts int
 	lastKEXSent          time.Time
 	lastSeen             time.Time
+	probeStarted         time.Time
 
 	playback     audio.PlaybackWriter
 	concealer    audio.Concealer

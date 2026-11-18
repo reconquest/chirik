@@ -349,6 +349,7 @@ func (client *client) peerListHandle(
 
 	if !item.peerex {
 		item.responseReceived = true
+		item.probeStarted = time.Time{}
 	}
 
 	listChanged := client.peerListMerge(item, records, now, membershipChanged)

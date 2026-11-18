@@ -213,9 +213,12 @@ func (client *client) audioReceive(
 	now time.Time,
 ) bool {
 	if item.peerex || !item.stateActive() || !item.audioEligible ||
-		len(payload) != proto.PlainFrame ||
-		item.playback == nil {
+		len(payload) != proto.PlainFrame {
 		return false
+	}
+
+	if item.playback == nil {
+		return true
 	}
 
 	missing := uint64(0)
@@ -243,17 +246,25 @@ func (client *client) audioReceive(
 		)
 	}
 
-	_, err := item.playback.Write(pcmBytes)
-	if err != nil {
-		client.linkFail(item, karma.Format(err, "write peer playback"))
-
-		return false
-	}
+	client.peerPlaybackWrite(item, pcmBytes)
 
 	item.lastAudioSeq = seq
 	item.lastSeen = now
 
 	return true
+}
+
+func (client *client) peerPlaybackWrite(item *link, data []byte) {
+	_, err := item.playback.Write(data)
+	if err == nil {
+		return
+	}
+
+	linkPlaybackClose(item)
+
+	if client.logger != nil {
+		client.logger.Print("ERROR ", karma.Format(err, "write peer playback"))
+	}
 }
 
 func (client *client) audioPeerCount() int {

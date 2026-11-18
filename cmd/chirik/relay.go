@@ -112,6 +112,7 @@ func (client *client) relayCandidateProbe(
 ) {
 	item.responseReceived = false
 	item.responseDeadline = now.Add(delay)
+	item.probeStarted = now
 	item.requestAttempts = 0
 	item.requestNext = now
 
@@ -138,6 +139,7 @@ func (client *client) relayCandidateRestart(item *link, now time.Time) error {
 	item.kexDeadline = now.Add(proto.KEXTimeout)
 	item.requestNext = time.Time{}
 	item.responseDeadline = time.Time{}
+	item.probeStarted = time.Time{}
 	item.requestAttempts = 0
 	item.lastKEXSent = time.Time{}
 

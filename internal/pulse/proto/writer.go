@@ -23,10 +23,15 @@ func (p *ProtocolWriter) flush() {
 	if p.err != nil {
 		return
 	}
-	_, err := p.w.Write(p.buf[:p.pos])
-	if err != nil {
+	written, err := p.w.Write(p.buf[:p.pos])
+	if err == nil && written != p.pos {
+		err = io.ErrShortWrite
+	}
+
+	if p.err == nil {
 		p.err = err
 	}
+
 	p.pos = 0
 }
 
