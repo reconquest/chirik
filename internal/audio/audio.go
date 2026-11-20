@@ -42,10 +42,11 @@ type PlaybackWriter interface {
 }
 
 type Playback struct {
-	device *Device
-	buffer *pcmBuffer
-	stream *pulse.PlaybackStream
-	close  sync.Once
+	waitForSpace bool
+	device       *Device
+	buffer       *pcmBuffer
+	stream       *pulse.PlaybackStream
+	close        sync.Once
 }
 
 type pcmBuffer struct {
@@ -192,6 +193,17 @@ func (device *Device) PlaybackOpen(mediaName string) (*Playback, error) {
 	return playback, nil
 }
 
+func (device *Device) CuePlaybackOpen(mediaName string) (*Playback, error) {
+	playback, err := device.PlaybackOpen(mediaName)
+	if err != nil {
+		return nil, err
+	}
+
+	playback.waitForSpace = true
+
+	return playback, nil
+}
+
 func (device *Device) Wait(ctx context.Context) error {
 	select {
 	case <-ctx.Done():
@@ -241,6 +253,17 @@ func (playback *Playback) Write(
 		}
 
 		return 0, err
+	}
+
+	if playback.waitForSpace {
+		chunk := append([]byte(nil), data...)
+		select {
+		case playback.buffer.chunks <- chunk:
+			return len(data), nil
+
+		case <-playback.stream.Done():
+			return 0, io.ErrClosedPipe
+		}
 	}
 
 	return playback.buffer.Write(data)

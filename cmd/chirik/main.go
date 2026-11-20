@@ -185,11 +185,13 @@ func chirpClientOptions(
 		config:       *cfg,
 		local:        local,
 		playbackOpen: playbackOpen,
-		cueOpen:      playbackOpen,
-		stdout:       stdout,
-		stderr:       stderr,
-		logger:       logger,
-		debug:        cfg.debug,
+		cueOpen: func(name string) (audio.PlaybackWriter, error) {
+			return device.CuePlaybackOpen(name)
+		},
+		stdout: stdout,
+		stderr: stderr,
+		logger: logger,
+		debug:  cfg.debug,
 	}
 }
 

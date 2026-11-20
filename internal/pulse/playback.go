@@ -389,6 +389,8 @@ func (p *PlaybackStream) Close() {
 	})
 }
 
+func (p *PlaybackStream) Done() <-chan struct{} { return p.done }
+
 // Closed returns wether the stream was closed.
 func (p *PlaybackStream) Closed() bool { return p.state.is(closed, serverLost) }
 

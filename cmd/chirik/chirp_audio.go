@@ -44,6 +44,9 @@ func (client *client) peerCueQueue(cue peerCue) {
 	select {
 	case client.cues <- cue:
 	default:
+		if cue == peerCueDisconnect {
+			client.pendingDisconnects++
+		}
 	}
 }
 

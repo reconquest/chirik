@@ -43,7 +43,7 @@ const (
 	RequestAttempts    = 3
 	ResponseTimeout    = 10 * time.Second
 	RelayFallbackDelay = 2 * time.Second
-	PeerTTL            = time.Minute
+	PeerTTL            = time.Second
 	EntryTTL           = 24 * time.Hour
 
 	relayPrefixBytes      = 1

@@ -28,10 +28,11 @@ type client struct {
 	debug        bool
 	stderr       io.Writer
 
-	cuePlayback audio.PlaybackWriter
-	links       map[string][]*link
-	seen        map[proto.Handle]struct{}
-	discovery   *discoveryEngine
+	pendingDisconnects int
+	cuePlayback        audio.PlaybackWriter
+	links              map[string][]*link
+	seen               map[proto.Handle]struct{}
+	discovery          *discoveryEngine
 
 	frames   chan []byte
 	cues     chan peerCue
@@ -97,7 +98,16 @@ func (client *client) runEvent(
 	ticks, bitrates <-chan time.Time,
 	sampledAt *time.Time,
 ) (bool, error) {
+	var disconnects chan<- peerCue
+
+	if client.pendingDisconnects > 0 {
+		disconnects = client.cues
+	}
+
 	select {
+	case disconnects <- peerCueDisconnect:
+		client.pendingDisconnects--
+
 	case <-client.ctx.Done():
 		return true, nil
 
