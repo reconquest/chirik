@@ -302,6 +302,7 @@ func (client *client) linkSeenRemove(item *link) {
 	if known && handle != client.cfg.handle &&
 		!client.peerHandleTracked(handle) {
 		delete(client.seen, handle)
+		delete(client.peerMuted, handle)
 	}
 }
 

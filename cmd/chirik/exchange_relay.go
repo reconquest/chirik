@@ -113,7 +113,8 @@ func relayInnerValid(packet []byte) bool {
 	}
 
 	switch kind {
-	case proto.Type_Request, proto.Type_PeerListAudio, proto.Type_Audio:
+	case proto.Type_Request, proto.Type_PeerListAudio,
+		proto.Type_Audio, proto.Type_MuteState:
 		return true
 
 	default:
@@ -128,5 +129,5 @@ func relayInnerLoggable(packet []byte) bool {
 
 	kind, _, _, _, valid := proto.EnvelopeParse(packet)
 
-	return valid && kind != proto.Type_Audio
+	return valid && kind != proto.Type_Audio && kind != proto.Type_MuteState
 }

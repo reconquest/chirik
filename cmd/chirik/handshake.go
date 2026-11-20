@@ -220,9 +220,15 @@ func (client *client) encryptedHandle(
 	payload []byte,
 	packet []byte,
 ) bool {
+	wasEligible := item.audioEligible
 	now := time.Now()
+
 	if !client.encryptedPayloadHandle(item, kind, seq, payload, now) {
 		return false
+	}
+
+	if !wasEligible && item.audioEligible {
+		client.voiceLinkSend(item, proto.Type_MuteState, client.mutePayload())
 	}
 
 	item.lastSeen = now
@@ -243,7 +249,7 @@ func (client *client) encryptedPayloadHandle(
 ) bool {
 	switch kind {
 	case proto.Type_Request:
-		return !item.peerex && client.requestHandle(item, payload, now)
+		return client.requestHandle(item, payload, now)
 
 	case proto.Type_PeerList:
 		return item.peerex && client.peerListHandle(item, payload, false, now)
@@ -253,6 +259,9 @@ func (client *client) encryptedPayloadHandle(
 
 	case proto.Type_Audio:
 		return client.audioReceive(item, seq, payload, now)
+
+	case proto.Type_MuteState:
+		return client.muteStateReceive(item, payload)
 
 	case proto.Type_Relay:
 		return client.relayEncryptedHandle(item, payload)
@@ -278,7 +287,7 @@ func (client *client) requestHandle(
 	now time.Time,
 ) bool {
 	handle, channel, _, ok := proto.RequestParse(payload)
-	if !ok || channel != client.cfg.channel {
+	if item.peerex || !ok || channel != client.cfg.channel {
 		return false
 	}
 

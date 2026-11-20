@@ -34,6 +34,8 @@ type peerCue byte
 const (
 	peerCueConnect peerCue = iota
 	peerCueDisconnect
+	peerCueMute
+	peerCueUnmute
 )
 
 func (client *client) peerCueQueue(cue peerCue) {
@@ -41,13 +43,7 @@ func (client *client) peerCueQueue(cue peerCue) {
 		return
 	}
 
-	select {
-	case client.cues <- cue:
-	default:
-		if cue == peerCueDisconnect {
-			client.pendingDisconnects++
-		}
-	}
+	client.pendingCues = append(client.pendingCues, cue)
 }
 
 func (client *client) peerCuePlay(cue peerCue) {
@@ -128,7 +124,7 @@ func peerCuePCM(cue peerCue) []byte {
 			sweep := peerCueSweepMin +
 				(peerCueSweepMax-peerCueSweepMin)*progress
 
-			if cue == peerCueDisconnect {
+			if cue == peerCueDisconnect || cue == peerCueMute {
 				sweep = peerCueSweepMax -
 					(peerCueSweepMax-peerCueSweepMin)*progress
 			}
@@ -151,34 +147,48 @@ func peerCuePCM(cue peerCue) []byte {
 }
 
 func peerCueFrequency(cue peerCue, note int) float64 {
-	if cue == peerCueConnect {
+	switch cue {
+	case peerCueConnect:
 		return [peerCueNoteCount]float64{480, 960, 1440}[note]
-	}
 
-	return [peerCueNoteCount]float64{1440, 720, 240}[note]
+	case peerCueDisconnect:
+		return [peerCueNoteCount]float64{1440, 720, 240}[note]
+
+	case peerCueMute:
+		return [peerCueNoteCount]float64{880, 660, 330}[note]
+
+	case peerCueUnmute:
+		return [peerCueNoteCount]float64{330, 660, 880}[note]
+
+	default:
+		return 0
+	}
 }
 
-func (client *client) audioSend(payload []byte) {
+func (client *client) voiceBroadcast(kind byte, payload []byte) {
 	for _, links := range client.links {
 		for _, item := range append([]*link(nil), links...) {
-			client.audioLinkSend(item, payload)
+			client.voiceLinkSend(item, kind, payload)
 		}
 	}
 }
 
-func (client *client) audioLinkSend(item *link, payload []byte) {
-	if item.peerex || !item.stateActive() || !item.audioEligible {
+func (client *client) voiceLinkSend(item *link, kind byte, payload []byte) {
+	if !item.voicePeer() {
 		return
 	}
 
-	packet, err := item.voice.Seal(proto.Type_Audio, payload)
+	packet, err := item.voice.Seal(kind, payload)
 	if err != nil {
-		client.linkRemove(item, karma.Format(err, "encrypt audio").Error())
+		client.linkRemove(
+			item,
+			karma.Format(err, "encrypt peer data").Error(),
+		)
 
 		return
 	}
 
-	err = client.audioPacketSend(item, packet)
+	err = client.voicePacketSend(item, packet)
 	if err != nil {
 		client.linkRemove(item, err.Error())
 
@@ -191,11 +201,11 @@ func (client *client) audioLinkSend(item *link, payload []byte) {
 	client.counters.sentBytes.Add(uint64(len(packet)))
 }
 
-func (client *client) audioPacketSend(item *link, packet []byte) error {
+func (client *client) voicePacketSend(item *link, packet []byte) error {
 	if item.relay {
 		err := client.relaySend(item.handle, packet)
 		if err != nil {
-			return karma.Format(err, "send relayed audio")
+			return karma.Format(err, "send relayed voice peer packet")
 		}
 
 		return nil
@@ -203,7 +213,7 @@ func (client *client) audioPacketSend(item *link, packet []byte) error {
 
 	err := datagramSend(client.t.conn, item.addr, packet)
 	if err != nil {
-		return karma.Format(err, "send audio")
+		return karma.Format(err, "send voice peer packet")
 	}
 
 	return nil
@@ -215,7 +225,7 @@ func (client *client) audioReceive(
 	payload []byte,
 	now time.Time,
 ) bool {
-	if item.peerex || !item.stateActive() || !item.audioEligible ||
+	if !item.voicePeer() ||
 		len(payload) != proto.PlainFrame {
 		return false
 	}

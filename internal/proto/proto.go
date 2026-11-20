@@ -20,6 +20,7 @@ const (
 	Type_PeerList      = byte(0x06)
 	Type_PeerListAudio = byte(0x07)
 	Type_Relay         = byte(0x08)
+	Type_MuteState     = byte(0x09)
 	Type_KEX           = byte(0x80)
 
 	PublicKeyBytes = 32
@@ -93,7 +94,8 @@ func TypeEncrypted(kind byte) bool {
 		Type_Request,
 		Type_PeerList,
 		Type_PeerListAudio,
-		Type_Relay:
+		Type_Relay,
+		Type_MuteState:
 		return true
 
 	default:

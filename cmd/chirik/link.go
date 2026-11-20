@@ -69,6 +69,10 @@ type counters struct {
 
 func (link *link) stateActive() bool { return link.state == linkState_Active }
 
+func (link *link) voicePeer() bool {
+	return !link.peerex && link.stateActive() && link.audioEligible
+}
+
 func (link *link) identity() (proto.Handle, bool) {
 	switch {
 	case link.handleKnown:

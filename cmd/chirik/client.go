@@ -28,11 +28,12 @@ type client struct {
 	debug        bool
 	stderr       io.Writer
 
-	pendingDisconnects int
-	cuePlayback        audio.PlaybackWriter
-	links              map[string][]*link
-	seen               map[proto.Handle]struct{}
-	discovery          *discoveryEngine
+	pendingCues []peerCue
+	peerMuted   map[proto.Handle]bool
+	cuePlayback audio.PlaybackWriter
+	links       map[string][]*link
+	seen        map[proto.Handle]struct{}
+	discovery   *discoveryEngine
 
 	frames   chan []byte
 	cues     chan peerCue
@@ -98,15 +99,19 @@ func (client *client) runEvent(
 	ticks, bitrates <-chan time.Time,
 	sampledAt *time.Time,
 ) (bool, error) {
-	var disconnects chan<- peerCue
+	var (
+		cues    chan<- peerCue
+		nextCue peerCue
+	)
 
-	if client.pendingDisconnects > 0 {
-		disconnects = client.cues
+	if len(client.pendingCues) > 0 {
+		cues = client.cues
+		nextCue = client.pendingCues[0]
 	}
 
 	select {
-	case disconnects <- peerCueDisconnect:
-		client.pendingDisconnects--
+	case cues <- nextCue:
+		client.pendingCues = client.pendingCues[1:]
 
 	case <-client.ctx.Done():
 		return true, nil
@@ -118,7 +123,7 @@ func (client *client) runEvent(
 		return client.commandHandle(command, client.logger), nil
 
 	case frame := <-client.frames:
-		client.audioSend(frame)
+		client.voiceBroadcast(proto.Type_Audio, frame)
 
 	case packet := <-client.t.packets:
 		client.packetHandle(packet)
@@ -127,6 +132,7 @@ func (client *client) runEvent(
 		return false, client.tick(now)
 
 	case now := <-bitrates:
+		client.voiceBroadcast(proto.Type_MuteState, client.mutePayload())
 		client.output.bitrateWrite(
 			client.peerBitrates(),
 			now.Sub(*sampledAt),
@@ -157,14 +163,7 @@ func (client *client) statsLog(logger *log.Logger) {
 func (client *client) commandHandle(command byte, logger *log.Logger) bool {
 	switch command {
 	case commandMute:
-		muted := !client.muted.Load()
-		client.muted.Store(muted)
-
-		if muted {
-			client.output.lineWrite("muted")
-		} else {
-			client.output.lineWrite("unmuted")
-		}
+		client.muteToggle()
 
 		return false
 
